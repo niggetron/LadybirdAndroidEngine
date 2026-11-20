@@ -12,10 +12,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: ladybird-android-build
-  cancel-in-progress: false
-
 env:
   LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
   LADYBIRD_CACHE_DIR: ${{ github.workspace }}/Build/caches
