@@ -38,7 +38,7 @@ jobs:
       - name: Install system build tools (vcpkg ports)
         run: |
           sudo apt-get update
-          sudo apt-get install -y autoconf automake autoconf-archive libtool pkg-config nasm
+          sudo apt-get install -y autoconf automake autoconf-archive libtool pkg-config nasm ninja-build
 
       - name: Set up JDK 17
         uses: actions/setup-java@v6
