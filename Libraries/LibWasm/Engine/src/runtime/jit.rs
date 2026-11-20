@@ -682,6 +682,7 @@ mod native {
     use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
     /// The code the process's stores share.
+    #[allow(dead_code)]
     pub struct Stubs {
         pub trap_exit: u64,
         pub entry: u64,

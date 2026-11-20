@@ -52,6 +52,10 @@ else()
     target_sources(WebContent PRIVATE ../RendererSandboxUnimplemented.cpp)
 endif()
 
+if (ANDROID)
+    target_link_libraries(WebContent PRIVATE LibIPC)
+endif()
+
 target_link_libraries(WebContent PRIVATE webcontentservice LibSandbox LibURL)
 target_compile_options(WebContent PRIVATE $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wexit-time-destructors>)
 
