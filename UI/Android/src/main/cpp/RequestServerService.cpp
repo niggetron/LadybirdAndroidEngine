@@ -19,18 +19,20 @@
 #include <curl/curl.h>
 #include <RequestServer/ConnectionFromClient.h>
 #include <RequestServer/IsPrivate.h>
+#include <RequestServer/Resolver.h>
+#include <RequestServer/ResourceSubstitutionMap.h>
 #include <RequestServer/SiteBinding.h>
 
 namespace RequestServer {
 
-extern ByteString g_default_certificate_path;
+OwnPtr<ResourceSubstitutionMap> g_resource_substitution_map;
 
 }
 
 ErrorOr<int> service_main(int ipc_socket)
 {
 
-    RequestServer::g_default_certificate_path = ByteString::formatted("{}/cacert.pem", WebView::s_ladybird_resource_root);
+    RequestServer::set_default_certificate_path(ByteString::formatted("{}/cacert.pem", WebView::s_ladybird_resource_root));
 
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
