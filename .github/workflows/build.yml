@@ -65,6 +65,15 @@ jobs:
           restore-keys: |
             vcpkg-macos-android-
 
+      - name: Set up vcpkg (Ladybird bootstrap)
+        run: |
+          for i in 1 2 3; do
+            if python3 Meta/ladybird.py vcpkg --preset Release; then exit 0; fi
+            echo "vcpkg bootstrap failed, retry $i"
+            rm -rf Build/vcpkg
+          done
+          exit 1
+
       - name: Pre-cache pkgconf patch
         run: |
           mkdir -p Build/vcpkg/downloads
@@ -72,9 +81,6 @@ jobs:
             -o Build/vcpkg/downloads/pkgconf-add-missing-define-664b53d5c4920e66e4a57c7515ccfd1bd1477bac.patch \
             "https://github.com/pkgconf/pkgconf/commit/664b53d5c4920e66e4a57c7515ccfd1bd1477bac.patch?full_index=1"
           ls -l Build/vcpkg/downloads/pkgconf-*.patch
-
-      - name: Set up vcpkg (Ladybird bootstrap)
-        run: python3 Meta/ladybird.py vcpkg --preset Release
 
       - name: Give meson cross-ports a real native compiler
         run: |
