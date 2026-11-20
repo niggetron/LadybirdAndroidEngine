@@ -143,6 +143,20 @@ jobs:
             "$BT/apksigner" verify "LadybirdEngine-${{ steps.ver.outputs.version }}-${LABEL}.apk"
           done
 
+      - name: Dump vcpkg failure logs
+        if: failure()
+        run: |
+          echo "===== skia build logs ====="
+          find Build/vcpkg/buildtrees/skia -type f \( -name '*-out.log' -o -name '*-err.log' \) 2>/dev/null | while read -r f; do
+            echo "----- $f -----"
+            tail -120 "$f" || true
+          done
+          echo "===== manifest install log ====="
+          find . -name 'vcpkg-manifest-install.log' -type f 2>/dev/null | while read -r f; do
+            echo "----- $f -----"
+            tail -150 "$f" || true
+          done
+
       - name: Publish release
         run: |
           gh release create "${{ steps.ver.outputs.tag }}" \
