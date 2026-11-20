@@ -30,7 +30,7 @@ export XDG_CACHE_HOME="$CACHE_DIR"
 "$LADYBIRD_SOURCE_DIR"/Meta/ladybird.py vcpkg
 
 cmake -S "${LADYBIRD_SOURCE_DIR}/Meta/Lagom" -B "$BUILD_DIR/lagom-tools" \
-    -GNinja -Dpackage=LagomTools \
+    -GNinja -DCMAKE_MAKE_PROGRAM="$(command -v ninja)" -Dpackage=LagomTools \
     -DCMAKE_INSTALL_PREFIX="$BUILD_DIR/lagom-tools-install"  \
     -DCMAKE_C_COMPILER="$CC" \
     -DCMAKE_CXX_COMPILER="$CXX" \
