@@ -1,0 +1,1745 @@
+/*
+ * Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2022, Matthew Costa <ucosty@gmail.com>
+ * Copyright (c) 2024, Jamie Mansfield <jmansfield@cadixdev.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/kmalloc.h>
+#include <LibCore/EventLoop.h>
+#include <LibCore/Promise.h>
+#include <LibURL/Parser.h>
+#include <LibURL/URL.h>
+#include <LibWakeLock/DisplaySleepInhibitor.h>
+#include <LibWebCommon/HTML/SelectedFile.h>
+#include <LibWebView/Application.h>
+#include <LibWebView/MicrophoneAuthorizer.h>
+#include <LibWebView/PageTranslation.h>
+#include <LibWebView/URL.h>
+#include <LibWebView/Utilities.h>
+#include <LibWebView/WebContentClient.h>
+#include <UI/Qt/Application.h>
+#include <UI/Qt/ApplicationActions.h>
+#include <UI/Qt/BookmarkPopover.h>
+#include <UI/Qt/BrowserWindow.h>
+#include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/HubConnection.h>
+#include <UI/Qt/Icon.h>
+#include <UI/Qt/JavaScriptDialog.h>
+#include <UI/Qt/LadybirdButton.h>
+#if defined(AK_OS_MACOS)
+#    include <UI/Qt/MacWindow.h>
+#endif
+#include <UI/Qt/Menu.h>
+#include <UI/Qt/Motion.h>
+#include <UI/Qt/PermissionPromptPopover.h>
+#include <UI/Qt/Popover.h>
+#include <UI/Qt/SiteSettingsPopover.h>
+#include <UI/Qt/StringUtils.h>
+#include <UI/Qt/SuggestionProvider.h>
+#include <UI/Qt/SystemAppearance.h>
+#include <UI/Qt/Theme.h>
+
+#include <QAction>
+#include <QApplication>
+#include <QCalendarWidget>
+#include <QClipboard>
+#include <QColorDialog>
+#include <QCursor>
+#include <QDialogButtonBox>
+#include <QDynamicPropertyChangeEvent>
+#include <QFileDialog>
+#include <QFont>
+#include <QFontMetrics>
+#include <QHBoxLayout>
+#include <QImage>
+#include <QLocale>
+#include <QMenu>
+#include <QMessageBox>
+#include <QMimeData>
+#include <QMimeDatabase>
+#include <QPainter>
+#include <QPainterPath>
+#include <QPixmap>
+#include <QPushButton>
+#include <QResizeEvent>
+#include <QTimeEdit>
+#include <QTimer>
+#include <QToolButton>
+#include <QVBoxLayout>
+
+namespace Ladybird {
+
+static constexpr int HOVER_TEXT_CORNER_RADIUS = 4;
+static constexpr int HOVER_TEXT_VERTICAL_PADDING = 2 + 1;
+
+// The calendar's month buttons get chevrons in the palette's text color, since the style's own arrows stay dark in dark
+// mode.
+enum class ChevronDirection {
+    Left,
+    Right,
+};
+
+static QIcon calendar_month_chevron_icon(QWidget const& widget, ChevronDirection direction)
+{
+    bool const points_left = direction == ChevronDirection::Left;
+    static constexpr int size = 16;
+    auto device_pixel_ratio = widget.devicePixelRatioF();
+    QPixmap pixmap(QSize(size, size) * device_pixel_ratio);
+    pixmap.setDevicePixelRatio(device_pixel_ratio);
+    pixmap.fill(Qt::transparent);
+
+    QPainterPath chevron;
+    chevron.moveTo(points_left ? 10 : 6, 4);
+    chevron.lineTo(points_left ? 6 : 10, 8);
+    chevron.lineTo(points_left ? 10 : 6, 12);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(widget.palette().color(QPalette::WindowText), 1.75, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.drawPath(chevron);
+    return QIcon(pixmap);
+}
+
+static constexpr int PRIVATE_SESSION_POPOVER_WIDTH = 320;
+
+// The page's zoom, with buttons to change it and a way back to the default.
+class ZoomPopover final : public Popover {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    ZoomPopover(QWidget* parent, QAction& zoom_level)
+        : Popover(parent)
+    {
+        setAccessibleName("Page zoom");
+        card().setObjectName("LadybirdZoomPopover");
+        card().setFixedWidth(148);
+
+        auto* layout = new QVBoxLayout(&card());
+        layout->setContentsMargins(10, 10, 10, 8);
+        layout->setSpacing(4);
+
+        auto* controls = new QHBoxLayout;
+        controls->setSpacing(6);
+        auto make_button = [&](ChromeIcon icon, QString const& name, auto callback) {
+            auto* button = new QPushButton(&card());
+            button->setObjectName("LadybirdZoomButton");
+            button->setIcon(create_chrome_icon(icon, Theme::panel().body));
+            button->setIconSize({ 16, 16 });
+            button->setFixedSize(26, 24);
+            button->setAccessibleName(name);
+            button->setToolTip(name);
+            QObject::connect(button, &QPushButton::clicked, this, [this, callback] {
+                callback(*this);
+            });
+            return button;
+        };
+        controls->addWidget(make_button(ChromeIcon::ZoomOut, "Zoom out", [](ZoomPopover& popover) { if (popover.on_zoom_out) popover.on_zoom_out(); }));
+
+        auto* level = new QLabel(&card());
+        level->setObjectName("LadybirdZoomLevel");
+        level->setAlignment(Qt::AlignCenter);
+        controls->addWidget(level, 1);
+        auto update_level = [&zoom_level, level]() {
+            level->setText(zoom_level.isVisible() && !zoom_level.text().isEmpty() ? zoom_level.text() : QStringLiteral("100%"));
+        };
+        QObject::connect(&zoom_level, &QAction::changed, level, update_level);
+        update_level();
+
+        controls->addWidget(make_button(ChromeIcon::NewTab, "Zoom in", [](ZoomPopover& popover) { if (popover.on_zoom_in) popover.on_zoom_in(); }));
+        layout->addLayout(controls);
+
+        auto* footer = new QHBoxLayout;
+        footer->addStretch(1);
+        auto* reset = new QPushButton("Reset", &card());
+        reset->setObjectName("LadybirdPopoverLink");
+        reset->setCursor(Qt::PointingHandCursor);
+        QObject::connect(reset, &QPushButton::clicked, this, [this] {
+            if (on_reset)
+                on_reset();
+        });
+        footer->addWidget(reset);
+        footer->addStretch(1);
+        layout->addLayout(footer);
+    }
+
+    Function<void()> on_zoom_in;
+    Function<void()> on_zoom_out;
+    Function<void()> on_reset;
+};
+
+Tab::Tab(BrowserWindow* window, Optional<u64> hub_view_id)
+    : QWidget(window)
+    , WebView::SettingsObserver(Application::settings())
+    , m_window(window)
+{
+    create_tab_shell();
+    initialize(hub_view_id);
+}
+
+Tab::Tab(BrowserWindow* window, DeferredTab deferred_tab)
+    : QWidget(window)
+    , WebView::SettingsObserver(Application::settings())
+    , m_window(window)
+    , m_title(deferred_tab.title)
+    , m_favicon(deferred_tab.favicon)
+    , m_session_tab_id(deferred_tab.session_tab_id)
+    , m_deferred_tab(AK::move(deferred_tab))
+{
+    create_tab_shell();
+}
+
+void Tab::create_tab_shell()
+{
+    auto* tab_layout = new QBoxLayout(QBoxLayout::Direction::TopToBottom, this);
+    tab_layout->setSpacing(0);
+    tab_layout->setContentsMargins(0, 0, 0, 0);
+
+    create_tab_context_menu();
+}
+
+void Tab::initialize(Optional<u64> hub_view_id)
+{
+    auto* tab_layout = static_cast<QBoxLayout*>(layout());
+
+    auto view_initial_state = WebContentViewInitialState {
+        .is_private = m_window->is_private(),
+        .maximum_frames_per_second = m_window->refresh_rate(),
+        .display_id = m_window->display_id(),
+        .screen_shows_high_dynamic_range = m_window->screen_shows_high_dynamic_range(),
+        .owner_view_id = {},
+        .is_tab = true,
+    };
+
+    m_view = new WebContentView(this, hub_view_id, AK::move(view_initial_state));
+    // The window reports its geometry to its tabs as it is moved and resized, so a tab opened later has to be told
+    // where the window stands now.
+    m_view->set_window_position({ m_window->x(), m_window->y() });
+    m_view->set_window_size({ m_window->width(), m_window->height() });
+    m_javascript_dialog = new JavaScriptDialog(m_view);
+    m_javascript_dialog->on_page_dim_change = [this](qreal dim) { m_view->set_page_dim(dim); };
+    m_find_in_page = new FindInPageWidget(this, m_view);
+    m_view->add_floating_surface(*m_find_in_page);
+    m_find_in_page->setVisible(false);
+
+    // The window's toolbar holds the address field while it shows this tab.
+    m_location_edit = new LocationEdit(this, Application::settings(), make<SuggestionProvider>(m_window->is_private()));
+    m_location_edit->hide();
+    m_location_edit->installEventFilter(this);
+
+    m_view->installEventFilter(this);
+
+    m_hover_label = new HyperlinkLabel(this);
+    m_hover_label->hide();
+    m_hover_label->setContentsMargins(4, 2, 4, 2);
+    m_hover_label->setAutoFillBackground(true);
+
+    tab_layout->addWidget(m_view);
+
+    // NB: A page can block many requests in a burst while it loads, so the open popover catches up with them at most
+    //     ten times a second rather than for each one.
+    m_content_blocking_update_timer = new QTimer(this);
+    m_content_blocking_update_timer->setSingleShot(true);
+    m_content_blocking_update_timer->setInterval(100);
+    QObject::connect(m_content_blocking_update_timer, &QTimer::timeout, this, [this] {
+        // NB: A page that is not from a website has no content blocking settings to show.
+        if (m_site_settings_popover && m_site_settings_popover->isVisible() && m_site_settings_popover_origin.has_value())
+            m_site_settings_popover->set_content_blocking(view().content_blocking_snapshot());
+    });
+    view().on_content_blocking_change = [this](auto const&) {
+        if (m_site_settings_popover && m_site_settings_popover->isVisible() && !m_content_blocking_update_timer->isActive())
+            m_content_blocking_update_timer->start();
+    };
+
+    // The star bookmarks the page, then shows the bookmark to name it or file it, rather than toggling it.
+    auto* bookmark_action = create_application_action(*m_location_edit, view().toggle_bookmark_action());
+    QObject::disconnect(bookmark_action, &QAction::triggered, nullptr, nullptr);
+    QObject::connect(bookmark_action, &QAction::triggered, this, [this] { show_bookmark_popover(); });
+    m_location_edit->set_trailing_action(bookmark_action);
+
+    auto* zoom_level = create_application_action(*m_location_edit, view().reset_zoom_action(), IncludeActionIcon::No);
+    m_location_edit->set_zoom_action(zoom_level);
+
+    // The translate button shows the page's translation menu, rather than translating the page at once.
+    m_translate_action = create_application_action(*m_location_edit, view().translate_action());
+    m_location_edit->set_translate_action(m_translate_action);
+
+    view().on_performance_stats = [this](WebView::TabPerformanceStats const& stats) {
+        m_performance_stats = stats;
+        emit performance_stats_changed();
+    };
+
+    recreate_location_edit_icons();
+    update_chrome_style();
+
+    m_location_edit->on_site_settings_requested = [this] {
+        show_site_settings_popover();
+    };
+    m_location_edit->on_zoom_requested = [this, zoom_level] {
+        show_zoom_popover(*zoom_level);
+    };
+    m_location_edit->on_translate_requested = [this] {
+        show_translation_menu();
+    };
+
+    QObject::connect(m_view, &WebContentView::crash_overlay_changed, this, [this] {
+        update_tab_icon();
+    });
+
+    view().on_activate_tab = [this] {
+        m_window->activate_tab(tab_index());
+    };
+
+    view().on_close = [this] {
+        auto index = tab_index();
+        if (m_tab_to_activate_on_close) {
+            if (auto index_to_activate = m_window->tab_index(m_tab_to_activate_on_close); index_to_activate >= 0)
+                m_window->activate_tab(index_to_activate);
+        }
+        if (!m_window_is_closing)
+            m_window->definitely_close_tab(index);
+    };
+
+    view().on_request_web_compat_report_review = [this](WebCompatReportCapture capture) {
+        auto& tab = m_window->new_tab_from_url(URL::about_blank(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_tab(*this));
+        tab.view().on_close_web_compat_report_tab = [&tab] {
+            tab.m_tab_to_activate_on_close = nullptr;
+            tab.view().on_close();
+        };
+        tab.view().review_web_compat_report(AK::move(capture));
+        tab.enter_report_review(this, tr("Report Website Issue"));
+    };
+
+    // A review takes its screenshot on the page it reports, in the tab it was opened from, and comes back once done.
+    view().on_request_web_compat_report_screenshot = [this](Function<void(QImage)> on_selected) {
+        auto* reported_tab = m_tab_to_activate_on_close.data();
+        if (!reported_tab)
+            return;
+        m_window->activate_tab(m_window->tab_index(reported_tab));
+        reported_tab->view().select_web_compat_report_screenshot(AK::move(on_selected), [this, review_tab = QPointer { this }] {
+            if (review_tab)
+                m_window->activate_tab(m_window->tab_index(this));
+        });
+    };
+
+    QObject::connect(m_view, &WebContentView::image_overlay_unavailable, this, &Tab::update_hover_label);
+
+    view().on_link_hover = [this](auto const& url) {
+        m_hover_text = qstring_from_ak_string(url.to_byte_string());
+        update_hover_label();
+    };
+
+    view().on_link_unhover = [this]() {
+        hide_hover_label();
+    };
+
+    view().on_loading_state_change = [this](bool is_loading) {
+        set_loading(is_loading);
+    };
+    view().on_load_start = [this] {
+        m_window->on_tab_load_start(*this);
+    };
+    view().on_load_from_user_input = [this] {
+        m_window->on_tab_navigated_by_user(*this);
+    };
+    set_loading(view().is_loading());
+
+    view().on_load_finish = [this](auto const&) {
+        m_suppress_javascript_dialogs_until_navigation = false;
+    };
+
+    view().on_top_level_navigation_commit = [this] {
+        m_is_waiting_for_response = false;
+        m_suppress_javascript_dialogs_until_navigation = false;
+        m_javascript_dialogs_shown_by_document = 0;
+        m_javascript_dialogs_blocked_for_document = false;
+    };
+
+    view().on_browser_history_traversal_complete = [this] {
+        m_suppress_javascript_dialogs_until_navigation = false;
+        m_javascript_dialogs_shown_by_document = 0;
+        m_javascript_dialogs_blocked_for_document = false;
+    };
+
+    view().on_url_change = [this](auto const& url) {
+        m_location_edit->set_url(url);
+    };
+
+    m_location_edit->on_navigation = [this](auto input, auto fallback_url, auto destination_kind) {
+        location_edit_return_pressed(AK::move(input), AK::move(fallback_url), destination_kind);
+    };
+    QObject::connect(m_location_edit, &LocationEdit::focus_return_requested, this, [this] {
+        view().setFocus();
+    });
+
+    view().on_title_change = [this](auto const& title) {
+        auto new_title = qstring_from_utf16_string(title);
+        if (!m_is_loading && !m_title.isEmpty() && new_title != m_title && m_window->current_tab() != this)
+            m_needs_attention = true;
+        m_title = AK::move(new_title);
+        update_tab_title();
+    };
+
+    view().on_favicon_change = [this](auto const& bitmap) {
+        if (!bitmap.has_value()) {
+            m_favicon = {};
+            update_tab_icon();
+            return;
+        }
+
+        auto qimage = QImage(bitmap->scanline_u8(0), bitmap->width(), bitmap->height(), QImage::Format_ARGB32);
+        if (qimage.isNull())
+            return;
+        auto qpixmap = QPixmap::fromImage(qimage);
+        if (qpixmap.isNull())
+            return;
+
+        m_favicon = favicon_with_rounded_corners(qpixmap);
+        update_tab_icon();
+    };
+
+    // A dialog from a page says which site it comes from.
+    auto javascript_dialog_title = [this] {
+        auto origin = view().url().origin();
+        if (!origin.is_opaque())
+            return qformatted("{} says", qstring_from_ak_string(origin.host().serialize()));
+        return qformatted("{}:// says", qstring_from_ak_string(view().url().scheme()));
+    };
+
+    auto offer_to_block_further_dialogs = [this] {
+        return m_javascript_dialogs_shown_by_document++ > 0 ? JavaScriptDialog::OfferToBlockFurtherDialogs::Yes : JavaScriptDialog::OfferToBlockFurtherDialogs::No;
+    };
+
+    view().on_request_alert = [this, javascript_dialog_title, offer_to_block_further_dialogs](auto const& message) {
+        if (m_suppress_javascript_dialogs_until_navigation || m_javascript_dialogs_blocked_for_document) {
+            view().alert_closed();
+            return;
+        }
+        hide_hover_label();
+        m_javascript_dialog->set_title_icon(tab_icon());
+        m_javascript_dialog->show_alert(javascript_dialog_title(), qstring_from_utf16_string(message), offer_to_block_further_dialogs());
+    };
+
+    view().on_request_before_unload = [this](auto const& source, auto on_complete) {
+        hide_hover_label();
+        m_before_unload_completion = AK::move(on_complete);
+        m_window->raise_for_close_prompt();
+        m_javascript_dialog->set_title_icon(tab_icon());
+        m_javascript_dialog->show_before_unload(qstring_from_ak_string(source));
+    };
+
+    view().on_request_confirm = [this, javascript_dialog_title, offer_to_block_further_dialogs](auto const& message) {
+        if (m_suppress_javascript_dialogs_until_navigation || m_javascript_dialogs_blocked_for_document) {
+            view().confirm_closed(false);
+            return;
+        }
+        hide_hover_label();
+        m_javascript_dialog->set_title_icon(tab_icon());
+        m_javascript_dialog->show_confirm(javascript_dialog_title(), qstring_from_utf16_string(message), offer_to_block_further_dialogs());
+    };
+
+    view().on_request_prompt = [this, javascript_dialog_title, offer_to_block_further_dialogs](auto const& message, auto const& default_) {
+        if (m_suppress_javascript_dialogs_until_navigation || m_javascript_dialogs_blocked_for_document) {
+            view().prompt_closed({});
+            return;
+        }
+        hide_hover_label();
+        m_javascript_dialog->set_title_icon(tab_icon());
+        m_javascript_dialog->show_prompt(javascript_dialog_title(), qstring_from_utf16_string(message), qstring_from_utf16_string(default_), offer_to_block_further_dialogs());
+    };
+
+    view().on_request_set_prompt_text = [this](auto const& message) {
+        m_javascript_dialog->set_prompt_text(qstring_from_utf16_string(message));
+    };
+
+    m_javascript_dialog->on_complete = [this](auto type, bool accepted, auto const& prompt_text) {
+        if (m_javascript_dialog->blocks_further_dialogs())
+            m_javascript_dialogs_blocked_for_document = true;
+        switch (type) {
+        case JavaScriptDialog::Type::Alert:
+            view().alert_closed();
+            break;
+        case JavaScriptDialog::Type::BeforeUnload: {
+            auto on_complete = AK::move(m_before_unload_completion);
+            VERIFY(on_complete);
+            on_complete(accepted);
+            if (!accepted) {
+                if (!m_preserve_close_retry_state_on_dialog_dismissal)
+                    m_already_requested_close = false;
+                m_suppress_javascript_dialogs_until_navigation = false;
+            }
+            break;
+        }
+        case JavaScriptDialog::Type::Confirm:
+            view().confirm_closed(accepted);
+            break;
+        case JavaScriptDialog::Type::Prompt:
+            if (accepted)
+                view().prompt_closed(utf16_string_from_qstring(prompt_text));
+            else
+                view().prompt_closed({});
+            break;
+        }
+    };
+
+    view().on_before_browser_initiated_navigation = [this] {
+        m_suppress_javascript_dialogs_until_navigation = true;
+        m_javascript_dialog->dismiss();
+    };
+
+    view().on_web_content_crashed = [this](auto) {
+        m_suppress_javascript_dialogs_until_navigation = false;
+        m_javascript_dialog->reset();
+
+        // Close pickers owned by the crashed renderer with their completion signals disconnected; they
+        // must not reply to its replacement.
+        if (m_color_picker_dialog) {
+            auto* dialog = m_color_picker_dialog.data();
+            m_color_picker_dialog = nullptr;
+            QObject::disconnect(dialog, nullptr, this, nullptr);
+            dialog->close();
+            dialog->deleteLater();
+        }
+        if (m_date_picker_dialog) {
+            auto* dialog = m_date_picker_dialog.data();
+            m_date_picker_dialog = nullptr;
+            QObject::disconnect(dialog, nullptr, this, nullptr);
+            dialog->close();
+            dialog->deleteLater();
+        }
+        if (m_file_picker_dialog) {
+            auto* dialog = m_file_picker_dialog.data();
+            m_file_picker_dialog = nullptr;
+            QObject::disconnect(dialog, nullptr, this, nullptr);
+            dialog->close();
+        }
+        if (m_external_url_confirmation_dialog)
+            m_external_url_confirmation_dialog->close();
+        m_permission_prompts.ignore_all();
+    };
+
+    view().on_request_external_url_confirmation = [this](auto const& url, auto const& initiator_origin, String const& handler_name, auto on_complete) {
+        if (m_javascript_dialog->is_open() || m_color_picker_dialog || m_external_url_confirmation_dialog) {
+            on_complete(false);
+            return;
+        }
+
+        hide_hover_label();
+
+        auto initiator = initiator_origin.is_opaque() ? "This page"_string : initiator_origin.serialize();
+        auto application_name = handler_name.is_empty() ? "another application"sv : handler_name.bytes_as_string_view();
+        auto title = handler_name.is_empty() ? "Open external application?"_string : MUST(String::formatted("Open {}?", application_name));
+        auto message = MUST(String::formatted("{} wants to open a {} link with {}.", initiator, url.scheme(), application_name));
+        auto details = MUST(String::formatted("URL: '{}'", url));
+        auto open_button_text = handler_name.is_empty() ? "Open"_string : MUST(String::formatted("Open {}", application_name));
+
+        auto* dialog = new QMessageBox(&view());
+        m_external_url_confirmation_dialog = dialog;
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setIcon(QMessageBox::Icon::Question);
+        dialog->setWindowTitle(qstring_from_ak_string(title));
+        dialog->setTextFormat(Qt::PlainText);
+        dialog->setText(qstring_from_ak_string(message));
+        dialog->setDetailedText(qstring_from_ak_string(details));
+        auto* open_button = dialog->addButton(qstring_from_ak_string(open_button_text), QMessageBox::ButtonRole::AcceptRole);
+        dialog->addButton(QMessageBox::StandardButton::Cancel);
+        dialog->setDefaultButton(QMessageBox::StandardButton::Cancel);
+
+        QObject::connect(dialog, &QDialog::finished, this, [this, dialog = QPointer<QMessageBox> { dialog }, open_button, on_complete = AK::move(on_complete)](auto) mutable {
+            auto accepted = dialog && dialog->clickedButton() == open_button;
+            if (m_external_url_confirmation_dialog == dialog)
+                m_external_url_confirmation_dialog = nullptr;
+            on_complete(accepted);
+        });
+
+        dialog->open();
+    };
+
+    m_permission_prompts.create_popover = [this](WebView::PermissionPromptRequest const& request) {
+        auto* popover = new PermissionPromptPopover(this, request);
+        popover->update_chrome_style(palette());
+        auto position = [this, popover] {
+            move_popover_below(*popover, site_settings_anchor(), PopoverAlignment::Leading);
+        };
+        popover->adjustSize();
+        position();
+        popover->on_shown = [this, position = AK::move(position), request] {
+            position();
+            view().did_show_permission_prompt(request);
+        };
+        popover->on_open_settings = [] {
+            if (auto* authorizer = Application::the().microphone_authorizer())
+                authorizer->open_system_settings();
+        };
+        return popover;
+    };
+
+    view().on_request_permission = [this](WebView::PermissionPromptRequest const& request, WebView::PermissionPromptCallback on_outcome) {
+        // A tab opened in the background, or in a window that was never active, has had nothing hold its prompts yet.
+        update_permission_prompts();
+        m_permission_prompts.enqueue(request, AK::move(on_outcome));
+    };
+
+    view().on_cancel_permission_prompt = [this](WebView::PermissionPromptRequest const& request) {
+        m_permission_prompts.cancel(request);
+    };
+
+    view().on_state_change = [this](Hub::ViewState const& previous_state) {
+        if (previous_state.page_mute_state != view().page_mute_state())
+            emit audio_state_changed(tab_index());
+    };
+
+    view().on_tab_indicator_change = [this](WebView::TabIndicator indicator, bool visible) {
+        switch (indicator) {
+        case WebView::TabIndicator::PlayingAudio:
+            emit audio_state_changed(tab_index());
+            break;
+        case WebView::TabIndicator::UsingLocation:
+            m_location_edit->set_location_in_use(visible);
+            break;
+        case WebView::TabIndicator::UsingMicrophone:
+            m_location_edit->set_microphone_in_use(visible);
+            emit microphone_in_use_changed();
+            break;
+        }
+    };
+
+    view().on_request_accept_dialog = [this]() {
+        m_javascript_dialog->accept();
+    };
+
+    view().on_request_dismiss_dialog = [this]() {
+        m_javascript_dialog->dismiss();
+    };
+
+    view().on_request_color_picker = [this](Color current_color) {
+        m_color_picker_dialog = new QColorDialog(QColor(current_color.red(), current_color.green(), current_color.blue()), &view());
+
+        auto& dialog = *m_color_picker_dialog;
+        dialog.setWindowTitle("Ladybird");
+        dialog.setOption(QColorDialog::ShowAlphaChannel, false);
+        QObject::connect(&dialog, &QColorDialog::currentColorChanged, this, [this](QColor const& color) {
+            view().color_picker_update(Color(color.red(), color.green(), color.blue()), Web::HTML::ColorPickerUpdateState::Update);
+        });
+
+        QObject::connect(m_color_picker_dialog, &QDialog::finished, this, [this](auto result) {
+            if (result == QDialog::Accepted) {
+                auto& dialog = *m_color_picker_dialog;
+                view().color_picker_update(Color(dialog.selectedColor().red(), dialog.selectedColor().green(), dialog.selectedColor().blue()), Web::HTML::ColorPickerUpdateState::Closed);
+            } else {
+                view().color_picker_update({}, Web::HTML::ColorPickerUpdateState::Closed);
+            }
+
+            m_color_picker_dialog = nullptr;
+        });
+
+        m_color_picker_dialog->open();
+    };
+
+    view().on_request_date_picker = [this](Utf16String const& input_type, Utf16String const& value, Utf16String const& minimum, Utf16String const& maximum) {
+        if (m_date_picker_dialog) {
+            view().date_picker_closed({});
+            return;
+        }
+
+        // NB: The values come from the page, so anything that does not parse leaves the picker at its defaults. The
+        //     page sanitizes the value the picker sends back.
+        auto type = qstring_from_utf16_string(input_type);
+        bool const picks_date = type != "time";
+        bool const picks_time = type == "time" || type == "datetime-local";
+
+        auto parse_date = [&](QString const& string) -> QDate {
+            if (type == "month")
+                return QDate::fromString(string + "-01", "yyyy-MM-dd");
+            if (type == "week") {
+                auto parts = string.split("-W");
+                if (parts.size() != 2)
+                    return {};
+                bool year_ok = false;
+                bool week_ok = false;
+                auto year = parts[0].toInt(&year_ok);
+                auto week = parts[1].toInt(&week_ok);
+                if (!year_ok || !week_ok)
+                    return {};
+                // The first ISO week of a year holds January 4th.
+                auto january_fourth = QDate(year, 1, 4);
+                return january_fourth.addDays(1 - january_fourth.dayOfWeek() + (week - 1) * 7);
+            }
+            return QDate::fromString(string.left(10), "yyyy-MM-dd");
+        };
+        auto current_value = qstring_from_utf16_string(value);
+        auto current_time = type == "datetime-local" ? current_value.mid(11) : current_value;
+        // NB: A value with seconds or a fraction of a second keeps them, so that confirming the picker does not drop
+        //     them. The "z" format reads and writes one to three digits of the fraction.
+        bool const picks_seconds = current_time.length() > 5;
+        bool const picks_milliseconds = current_time.contains('.');
+        auto const time_format = picks_milliseconds ? QStringLiteral("HH:mm:ss.z")
+            : picks_seconds                         ? QStringLiteral("HH:mm:ss")
+                                                    : QStringLiteral("HH:mm");
+        auto* dialog = new QDialog(&view());
+        m_date_picker_dialog = dialog;
+        dialog->setWindowTitle("Ladybird");
+        auto* layout = new QVBoxLayout(dialog);
+
+        QCalendarWidget* calendar = nullptr;
+        if (picks_date) {
+            calendar = new QCalendarWidget(dialog);
+            calendar->setGridVisible(false);
+            calendar->setVerticalHeaderFormat(type == "week" ? QCalendarWidget::ISOWeekNumbers : QCalendarWidget::NoVerticalHeader);
+            calendar->setFirstDayOfWeek(type == "week" ? Qt::Monday : QLocale().firstDayOfWeek());
+            // Draw weekends like other days, rather than in Qt's default red.
+            calendar->setWeekdayTextFormat(Qt::Saturday, {});
+            calendar->setWeekdayTextFormat(Qt::Sunday, {});
+            calendar->setStyleSheet(
+                "#qt_calendar_navigationbar { background: transparent; }"
+                "#qt_calendar_navigationbar QToolButton { background: transparent; border: none; padding: 2px 6px; font-weight: 600; }"
+                "#qt_calendar_navigationbar QToolButton::menu-indicator { image: none; width: 0; }"
+                "#qt_calendar_navigationbar QToolButton:hover { background: palette(midlight); border-radius: 4px; }"
+                "QCalendarWidget QAbstractItemView { selection-background-color: palette(accent); selection-color: palette(highlighted-text); }");
+            if (auto* previous_month = calendar->findChild<QToolButton*>("qt_calendar_prevmonth"))
+                previous_month->setIcon(calendar_month_chevron_icon(*calendar, ChevronDirection::Left));
+            if (auto* next_month = calendar->findChild<QToolButton*>("qt_calendar_nextmonth"))
+                next_month->setIcon(calendar_month_chevron_icon(*calendar, ChevronDirection::Right));
+            if (auto date = parse_date(current_value); date.isValid())
+                calendar->setSelectedDate(date);
+            if (auto date = parse_date(qstring_from_utf16_string(minimum)); date.isValid())
+                calendar->setMinimumDate(date);
+            if (auto date = parse_date(qstring_from_utf16_string(maximum)); date.isValid())
+                calendar->setMaximumDate(date);
+            layout->addWidget(calendar);
+        }
+
+        QTimeEdit* time_edit = nullptr;
+        if (picks_time) {
+            time_edit = new QTimeEdit(dialog);
+            time_edit->setDisplayFormat(picks_milliseconds ? QStringLiteral("HH:mm:ss.zzz") : time_format);
+            if (auto time = QTime::fromString(current_time, time_format); time.isValid())
+                time_edit->setTime(time);
+            layout->addWidget(time_edit);
+        }
+
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, dialog);
+        QObject::connect(buttons, &QDialogButtonBox::accepted, dialog, &QDialog::accept);
+        QObject::connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
+        layout->addWidget(buttons);
+
+        QObject::connect(dialog, &QDialog::finished, this, [this, dialog, calendar, time_edit, type, time_format](int result) {
+            Optional<Utf16String> picked_value;
+            if (result == QDialog::Accepted) {
+                QString picked;
+                if (calendar) {
+                    auto date = calendar->selectedDate();
+                    if (type == "month") {
+                        picked = date.toString("yyyy-MM");
+                    } else if (type == "week") {
+                        int week_year = 0;
+                        auto week = date.weekNumber(&week_year);
+                        picked = QString("%1-W%2").arg(week_year, 4, 10, QChar('0')).arg(week, 2, 10, QChar('0'));
+                    } else {
+                        picked = date.toString("yyyy-MM-dd");
+                    }
+                }
+                if (time_edit) {
+                    if (!picked.isEmpty())
+                        picked += "T";
+                    picked += time_edit->time().toString(time_format);
+                }
+                picked_value = utf16_string_from_qstring(picked);
+            }
+            m_date_picker_dialog = nullptr;
+            dialog->deleteLater();
+            view().date_picker_closed(AK::move(picked_value));
+        });
+
+        dialog->open();
+    };
+
+    view().on_request_file_picker = [this](auto const& accepted_file_types, auto allow_multiple_files) {
+        QStringList accepted_file_filters;
+        QMimeDatabase mime_database;
+
+        for (auto const& filter : accepted_file_types.filters) {
+            filter.visit(
+                [&](Web::HTML::FileFilter::FileType type) {
+                    QString title;
+                    QString filter;
+
+                    switch (type) {
+                    case Web::HTML::FileFilter::FileType::Audio:
+                        title = "Audio files";
+                        filter = "audio/";
+                        break;
+                    case Web::HTML::FileFilter::FileType::Image:
+                        title = "Image files";
+                        filter = "image/";
+                        break;
+                    case Web::HTML::FileFilter::FileType::Video:
+                        title = "Video files";
+                        filter = "video/";
+                        break;
+                    }
+
+                    QStringList extensions;
+
+                    for (auto const& mime_type : mime_database.allMimeTypes()) {
+                        if (mime_type.name().startsWith(filter))
+                            extensions.append(mime_type.globPatterns());
+                    }
+
+                    accepted_file_filters.append(qformatted("{} ({})", title, extensions.join(" ")));
+                },
+                [&](Web::HTML::FileFilter::MimeType const& filter) {
+                    if (auto mime_type = mime_database.mimeTypeForName(qstring_from_utf16_string(filter.value)); mime_type.isValid())
+                        accepted_file_filters.append(mime_type.filterString());
+                },
+                [&](Web::HTML::FileFilter::Extension const& filter) {
+                    accepted_file_filters.append(qformatted("*.{}", qstring_from_utf16_string(filter.value)));
+                });
+        }
+
+        accepted_file_filters.size() > 1 ? accepted_file_filters.prepend("All files (*)") : accepted_file_filters.append("All files (*)");
+        auto filters = accepted_file_filters.join(";;");
+
+        auto allow_multiple = allow_multiple_files == Web::HTML::AllowMultipleFiles::Yes;
+        auto* dialog = new QFileDialog(this, allow_multiple ? "Select files" : "Select file", QDir::homePath(), filters);
+        m_file_picker_dialog = dialog;
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setFileMode(allow_multiple ? QFileDialog::ExistingFiles : QFileDialog::ExistingFile);
+
+        QObject::connect(dialog, &QDialog::finished, this, [this, dialog = QPointer<QFileDialog> { dialog }](int result) {
+            Vector<Web::HTML::SelectedFile> selected_files;
+
+            if (dialog && result == QDialog::Accepted) {
+                for (auto const& path : dialog->selectedFiles()) {
+                    auto file_path = ak_byte_string_from_qstring(path);
+
+                    if (auto file = WebView::create_selected_file(file_path); file.is_error())
+                        warnln("Unable to open file {}: {}", file_path, file.error());
+                    else
+                        selected_files.append(file.release_value());
+                }
+            }
+
+            if (m_file_picker_dialog == dialog)
+                m_file_picker_dialog = nullptr;
+            view().file_picker_closed(std::move(selected_files));
+        });
+
+        dialog->open();
+    };
+
+    view().on_find_in_page = [this](auto current_match_index, auto const& total_match_count) {
+        m_find_in_page->update_result_label(current_match_index, total_match_count);
+    };
+
+    view().on_restore_window = [this]() {
+        m_window->showNormal();
+    };
+
+    view().on_reposition_window = [this](auto const& position) {
+        m_window->move(position.x(), position.y());
+    };
+
+    view().on_resize_window = [this](auto const& size) {
+        m_window->resize(size.width(), size.height());
+    };
+
+    view().on_maximize_window = [this]() {
+        m_window->showMaximized();
+    };
+
+    view().on_minimize_window = [this]() {
+        m_window->showMinimized();
+    };
+
+    view().on_fullscreen_window = [this]() {
+        // NB: Only the tab on display goes full screen. A request from another tab came after the user moved on.
+        if (m_window->current_tab() != this) {
+            view().deny_fullscreen_window();
+            return;
+        }
+        m_window->fullscreen_mode().enter(this);
+    };
+
+    view().on_exit_fullscreen_window = [this]() {
+        m_window->fullscreen_mode().exit(FullscreenMode::ExitInitiatedBy::WebContent, this);
+    };
+
+    view().on_screen_wake_lock_state_changed = [this](auto wake_lock_state) {
+        set_screen_wake_lock_state(wake_lock_state);
+    };
+}
+
+void Tab::create_tab_context_menu()
+{
+    auto& application = ApplicationActions::the();
+
+    auto* duplicate_tab_action = new QAction("&Duplicate Tab", this);
+    QObject::connect(duplicate_tab_action, &QAction::triggered, this, [this]() {
+        m_window->duplicate_tab(*this);
+    });
+
+    m_pin_tab_action = new QAction("&Pin Tab", this);
+    QObject::connect(m_pin_tab_action, &QAction::triggered, this, [this]() {
+        if (m_is_pinned)
+            m_window->unpin_tab(*this);
+        else
+            m_window->pin_tab(*this);
+    });
+
+    auto* new_tab_action = new QAction(this);
+    QObject::connect(new_tab_action, &QAction::triggered, this, [this]() {
+        m_window->new_tab_from_url(Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_tab(*this));
+    });
+
+    auto* mute_tab_action = new QAction("&Mute Tab", this);
+    QObject::connect(mute_tab_action, &QAction::triggered, this, [this]() {
+        if (is_loaded())
+            view().toggle_page_mute_state();
+    });
+
+    auto* move_to_new_window_action = new QAction("Move to New &Window", this);
+    QObject::connect(move_to_new_window_action, &QAction::triggered, this, [this]() {
+        m_window->detach_tab_to_new_window(tab_index(), m_window->mapToGlobal(QPoint(m_window->width() / 4, m_window->height() / 4)));
+    });
+
+    auto* copy_link_action = new QAction("Copy &Link", this);
+    QObject::connect(copy_link_action, &QAction::triggered, this, [this]() {
+        QGuiApplication::clipboard()->setText(qstring_from_ak_string(url().serialize()));
+    });
+
+    auto* close_tab_action = new QAction("&Close Tab", this);
+    // NB: The shortcuts belong to the application's actions. The menu only shows them.
+    close_tab_action->setShortcut(QKeySequence(QKeySequence::Close));
+    close_tab_action->setShortcutContext(Qt::WidgetShortcut);
+    close_tab_action->setShortcutVisibleInContextMenu(true);
+    QObject::connect(close_tab_action, &QAction::triggered, this, [this]() {
+        request_close();
+    });
+
+    auto* close_following_tabs_action = new QAction(this);
+    QObject::connect(close_following_tabs_action, &QAction::triggered, this, [this]() {
+        // Closing the current tab selects a neighbor, which may be a tab about to close too, and selecting a tab that
+        // hasn't loaded loads it. So, this tab, which stays open, becomes the current tab first.
+        if (auto* current = m_window->current_tab(); current && m_window->tab_index(current) > tab_index() && !current->is_pinned())
+            m_window->activate_tab(tab_index());
+        for (auto i = m_window->tab_count() - 1; i > tab_index(); i--) {
+            if (!m_window->tab_at(i)->is_pinned())
+                m_window->request_to_close_tab(i);
+        }
+    });
+
+    auto* close_other_tabs_action = new QAction("Cl&ose Other Tabs", this);
+    QObject::connect(close_other_tabs_action, &QAction::triggered, this, [this]() {
+        // As with closing the following tabs, activate this tab first if the current tab is among those closing.
+        if (auto* current = m_window->current_tab(); current && current != this && !current->is_pinned())
+            m_window->activate_tab(tab_index());
+        for (auto i = m_window->tab_count() - 1; i >= 0; i--) {
+            if (i == tab_index() || m_window->tab_at(i)->is_pinned())
+                continue;
+
+            m_window->request_to_close_tab(i);
+        }
+    });
+
+    m_context_menu = new QMenu("Context menu", this);
+    m_context_menu->addAction(new_tab_action);
+    m_context_menu->addSeparator();
+    m_context_menu->addAction(create_application_action(*this, application.reload_action(), IncludeActionIcon::No));
+    m_context_menu->addAction(duplicate_tab_action);
+    m_context_menu->addAction(m_pin_tab_action);
+    m_context_menu->addAction(mute_tab_action);
+    m_context_menu->addSeparator();
+    m_context_menu->addAction(move_to_new_window_action);
+    m_context_menu->addAction(copy_link_action);
+    m_context_menu->addSeparator();
+    m_context_menu->addAction(close_tab_action);
+    m_context_menu->addAction(close_other_tabs_action);
+    m_context_menu->addAction(close_following_tabs_action);
+    m_context_menu->addSeparator();
+    m_context_menu->addAction(Application::the().reopen_recently_closed_tab_action());
+
+    QObject::connect(m_context_menu, &QMenu::aboutToShow, this, [this, new_tab_action, close_following_tabs_action, mute_tab_action, move_to_new_window_action]() {
+        auto is_horizontal = m_window->tab_widget().tab_bar()->tab_layout() == TabLayout::Horizontal;
+        new_tab_action->setText(is_horizontal ? "New Tab to the &Right" : "New Tab &Below");
+        close_following_tabs_action->setText(is_horizontal ? "Close Tabs to the R&ight" : "Close Tabs B&elow");
+
+        // A tab that hasn't loaded has no page to mute yet.
+        mute_tab_action->setEnabled(is_loaded());
+        mute_tab_action->setText(is_loaded() && view().page_mute_state() == Web::HTML::MuteState::Muted ? "Un&mute Tab" : "&Mute Tab");
+        move_to_new_window_action->setEnabled(m_window->tab_count() > 1);
+    });
+}
+
+// The window's toolbar can hold the address field while the tab goes away with the window.
+Tab::~Tab()
+{
+    delete m_location_edit;
+}
+
+void Tab::park_location_editing()
+{
+    // A tab that hasn't loaded has no omnibox yet, so it has no editing session to park.
+    if (!is_loaded())
+        return;
+    m_location_edit->park_editing_session();
+}
+
+void Tab::ensure_loaded()
+{
+    if (is_loaded())
+        return;
+
+    // Until initialize() has built the view, url() reads the deferred tab's URL, so the deferred tab stays until then.
+    auto deferred_url = m_deferred_tab->url;
+    initialize({});
+    m_deferred_tab.clear();
+
+    if (m_session_tab_id.has_value())
+        view().set_session_tab_id(*m_session_tab_id);
+    emit loaded();
+
+    Optional<WebView::SessionHistorySnapshot> history;
+    if (m_session_tab_id.has_value())
+        history = m_window->session().load_tab_history(*m_session_tab_id);
+    if (!history.has_value() || view().restore_session_history_from_snapshot(history.release_value()).is_error())
+        navigate(deferred_url);
+}
+
+URL::URL Tab::url() const
+{
+    if (!is_loaded())
+        return m_deferred_tab->url;
+    return view().url();
+}
+
+Optional<SessionTabId> Tab::session_tab_id() const
+{
+    // A loaded tab's view holds the ID it reports its state under.
+    if (is_loaded())
+        return view().session_tab_id();
+    return m_session_tab_id;
+}
+
+void Tab::set_session_tab_id(SessionTabId session_tab_id)
+{
+    m_session_tab_id = session_tab_id;
+    if (is_loaded())
+        view().set_session_tab_id(session_tab_id);
+}
+
+void Tab::clear_session_tab_id()
+{
+    m_session_tab_id.clear();
+    if (is_loaded())
+        view().clear_session_tab_id();
+}
+
+void Tab::focus_location_editor(FocusRingTransition focus_ring_transition)
+{
+    if (!is_loaded())
+        return;
+
+#if defined(AK_OS_MACOS)
+    make_appkit_window_first_responder(*m_location_edit);
+#endif
+    m_location_edit->setFocus();
+    if (focus_ring_transition == FocusRingTransition::Immediate)
+        m_location_edit->show_focus_ring_at_once();
+    m_location_edit->selectAll();
+    m_location_edit->show_autocomplete();
+}
+
+void Tab::set_window(BrowserWindow& window)
+{
+    if (&window == m_window)
+        return;
+
+    if (!is_loaded()) {
+        m_window = &window;
+        return;
+    }
+
+    m_window = &window;
+    recreate_location_edit_icons();
+
+    // The tab's pages hold the geometry of the window that hosted them until now.
+    m_view->set_window_position({ window.x(), window.y() });
+    m_view->set_window_size({ window.width(), window.height() });
+}
+
+void Tab::set_pinned(bool pinned)
+{
+    m_is_pinned = pinned;
+    m_pin_tab_action->setText(pinned ? "Un&pin Tab" : "&Pin Tab");
+}
+
+void Tab::navigate(URL::URL const& url)
+{
+    view().load_from_user_input(url);
+}
+
+void Tab::load_html(StringView html)
+{
+    view().load_html(html);
+}
+
+void Tab::location_edit_return_pressed(String input, Optional<URL::URL> fallback_url, WebView::OmniboxDestinationKind destination_kind)
+{
+    if (input.is_empty())
+        return;
+
+    view().set_next_history_visit_transition(WebView::HistoryVisitTransition::Omnibox);
+    if (destination_kind == WebView::OmniboxDestinationKind::Search) {
+        m_window->on_tab_navigated_by_user(*this);
+        if (fallback_url.has_value())
+            view().load(*fallback_url);
+        else
+            view().load_navigation_error_page(input);
+    } else {
+        view().load_from_user_input(input, AK::move(fallback_url));
+    }
+
+    auto is_external_url = destination_kind == WebView::OmniboxDestinationKind::URL
+        && WebView::classify_user_input(input).classification == WebView::UserInputClassification::ExternalURL;
+    if (is_external_url)
+        m_location_edit->set_url(view().displayed_url());
+
+    view().setFocus();
+}
+
+// A tab whose page crashed shows a warning in place of its favicon.
+QIcon Tab::tab_icon() const
+{
+    if (is_loaded() && view().crash_overlay_active())
+        return create_chrome_icon(ChromeIcon::Warning, Theme::chrome(*this).warning);
+    return m_favicon;
+}
+
+QString Tab::title() const
+{
+    auto title = m_fixed_title.value_or(m_title);
+    // A blank page is what a new tab shows, so it is called a new tab.
+    if (!m_fixed_title.has_value() && is_loaded() && view().url() == URL::about_blank() && (title.isEmpty() || title == QStringLiteral("about:blank")))
+        title = "New Tab";
+    if (!is_loaded() || !Application::settings().config_variable_as_bool(WebView::ConfigVariableID::ShowWebContentProcessIDInTabTitle))
+        return title;
+
+    return QString("%1 [%2]").arg(title).arg(view().web_content_pid());
+}
+
+// A tab opened only for a review shows it over a blank page, under the review's own title if it has one, and closing it
+// goes back to the tab it was opened from. That lasts until the user takes the tab somewhere else. The tab starts out
+// loading about:blank, which is not somewhere else, but any page loaded after that is, about:blank included.
+void Tab::enter_report_review(Tab* tab_to_activate_on_close, Optional<QString> title)
+{
+    VERIFY(!m_report_review_navigation_listener.has_value());
+    m_tab_to_activate_on_close = tab_to_activate_on_close;
+    m_fixed_title = AK::move(title);
+    update_tab_title();
+
+    WebView::ViewImplementation::NavigationListener listener;
+    listener.on_load_start = [this](URL::URL const& url) {
+        if (m_has_loaded_report_review_page || url != URL::about_blank())
+            leave_report_review();
+    };
+    listener.on_load_finish = [this](URL::URL const&) { m_has_loaded_report_review_page = true; };
+    m_report_review_navigation_listener = view().add_navigation_listener(AK::move(listener));
+}
+
+// A report on its way keeps being sent, as it does when the tab closes.
+void Tab::leave_report_review()
+{
+    if (!m_report_review_navigation_listener.has_value())
+        return;
+
+    view().leave_report_review();
+    m_tab_to_activate_on_close = nullptr;
+    m_fixed_title.clear();
+    update_tab_title();
+
+    // The view is still telling its listeners about this navigation, so the listener goes once it is done.
+    QTimer::singleShot(0, this, [this, listener = m_report_review_navigation_listener.release_value()] {
+        view().remove_navigation_listener(listener);
+    });
+}
+
+void Tab::update_tab_title()
+{
+    emit title_changed(tab_index(), title());
+}
+
+void Tab::tab_settings_changed()
+{
+    if (!is_loaded())
+        return;
+
+    recreate_location_edit_icons();
+}
+
+void Tab::config_variable_changed(WebView::ConfigVariableID variable)
+{
+    if (!is_loaded())
+        return;
+
+    if (variable == WebView::ConfigVariableID::ShowWebContentProcessIDInTabTitle)
+        update_tab_title();
+}
+
+qreal Tab::loading_ring_opacity() const
+{
+    if (m_is_loading)
+        return 1;
+    if (!m_load_finished_clock.isValid())
+        return 0;
+    auto elapsed = static_cast<qreal>(m_load_finished_clock.elapsed());
+    return max(0.0, 1 - (elapsed / Motion::FAST));
+}
+
+qreal Tab::loading_favicon_shrink() const
+{
+    if (!m_is_loading)
+        return loading_ring_opacity();
+    auto elapsed = static_cast<qreal>(m_load_started_clock.elapsed());
+    return Motion::enter_easing().valueForProgress(min(1.0, elapsed / Motion::BASE));
+}
+
+void Tab::set_loading(bool is_loading)
+{
+    if (m_is_loading == is_loading)
+        return;
+
+    m_is_loading = is_loading;
+    m_is_waiting_for_response = is_loading;
+    if (is_loading)
+        m_load_started_clock.start();
+    else
+        m_load_finished_clock.start();
+    emit loading_changed();
+}
+
+void Tab::update_tab_icon()
+{
+    auto index = tab_index();
+    if (index < 0)
+        return;
+    emit favicon_changed(index, tab_icon());
+}
+
+void Tab::open_file()
+{
+    auto filename = QFileDialog::getOpenFileUrl(this, "Open file", QDir::homePath(), "All Files (*.*)");
+    if (filename.isValid()) {
+        navigate(ak_url_from_qurl(filename));
+    }
+}
+
+int Tab::tab_index()
+{
+    return m_window->tab_index(this);
+}
+
+void Tab::set_screen_wake_lock_state(Web::ScreenWakeLockState wake_lock_state)
+{
+    switch (wake_lock_state) {
+    case Web::ScreenWakeLockState::Released:
+        m_screen_display_sleep_inhibitor.clear();
+        break;
+    case Web::ScreenWakeLockState::Acquired:
+        if (m_screen_display_sleep_inhibitor.has_value())
+            break;
+        if (auto inhibitor = WakeLock::DisplaySleepInhibitor::create("Ladybird Content"sv); !inhibitor.is_error())
+            m_screen_display_sleep_inhibitor = inhibitor.release_value();
+        break;
+    }
+}
+
+void Tab::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    if (isVisible())
+        did_get_real_size();
+    if (!is_loaded())
+        return;
+
+    if (!m_hover_text.isEmpty())
+        update_hover_label();
+}
+
+void Tab::hideEvent(QHideEvent* event)
+{
+    QWidget::hideEvent(event);
+    if (!is_loaded())
+        return;
+
+    hide_hover_label();
+    update_permission_prompts();
+}
+
+void Tab::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    update_permission_prompts();
+}
+
+// A tab's permission prompt waits, unanswered, while another tab is shown or another window is active. A popup that
+// comes up over an inactive window is closed by the next click or activation anywhere else.
+void Tab::update_permission_prompts()
+{
+    if (isVisible() && isActiveWindow())
+        m_permission_prompts.resume();
+    else
+        m_permission_prompts.suspend();
+}
+
+void Tab::update_hover_label()
+{
+    if (m_hover_text.isEmpty())
+        return;
+    m_hover_text_is_on_right = hover_text_belongs_on_right(m_view->mapFromGlobal(QCursor::pos()));
+    auto text = QFontMetrics(m_hover_label->font()).elidedText(m_hover_text, Qt::ElideRight, width() / 2 - 10);
+
+    // NB: Where the view can stack the text above the page itself, it stays inside the window and costs the page
+    //     nothing. A tooltip is a window of its own instead, which can stick out of the browser window.
+    auto image = render_hover_text(text);
+    auto size = image.deviceIndependentSize().toSize();
+    QPoint position { m_hover_text_is_on_right ? m_view->width() - size.width() : 0, m_view->height() - size.height() };
+    if (m_view->show_image_over_page(image, position)) {
+        m_hover_text_is_over_page = true;
+        m_hover_label->hide();
+        return;
+    }
+    if (m_hover_text_is_over_page) {
+        m_view->hide_image_over_page();
+        m_hover_text_is_over_page = false;
+    }
+
+    update_chrome_style();
+    m_hover_label->setText(text);
+    // NB: The label adds room of its own around the text, so only its size hint is wide enough for the whole text.
+    size = m_hover_label->sizeHint();
+    position = { m_hover_text_is_on_right ? m_view->width() - size.width() : 0, m_view->height() - size.height() };
+    m_hover_label->resize(size);
+    m_hover_label->move(m_view->mapToGlobal(position));
+    m_hover_label->raise();
+    m_hover_label->show();
+}
+
+void Tab::hide_hover_label()
+{
+    m_hover_text = {};
+    if (m_hover_text_is_over_page) {
+        m_view->hide_image_over_page();
+        m_hover_text_is_over_page = false;
+    }
+    m_hover_label->hide();
+}
+
+// NB: This looks only at the pointer and not at the width of the text, so that links with URLs of different lengths
+//     all put the text on the same side. The text is at most half as wide as the tab, so it stays clear of the
+//     pointer.
+bool Tab::hover_text_belongs_on_right(QPoint pointer) const
+{
+    // NB: Text on the right returns only when the pointer is clearly away, so it can't flip at the edge of the strip.
+    auto text_height = QFontMetrics { m_hover_label->font() }.height() + 2 * HOVER_TEXT_VERTICAL_PADDING;
+    auto strip_height = m_hover_text_is_on_right ? 2 * text_height : text_height;
+    return pointer.y() >= m_view->height() - strip_height && pointer.x() < m_view->width() / 2;
+}
+
+// Paints the hover text the way the hover label's style sheet does. It sits in a bottom corner of the page, and only
+// its corner toward the page is rounded.
+QImage Tab::render_hover_text(QString const& text) const
+{
+    static constexpr int horizontal_padding = 4 + 1;
+
+    QFontMetrics metrics { m_hover_label->font() };
+    QSize size { metrics.horizontalAdvance(text) + 2 * horizontal_padding, metrics.height() + 2 * HOVER_TEXT_VERTICAL_PADDING };
+    auto device_pixel_ratio = devicePixelRatioF();
+    QImage image { size * device_pixel_ratio, QImage::Format_ARGB32_Premultiplied };
+    image.setDevicePixelRatio(device_pixel_ratio);
+    image.fill(Qt::transparent);
+
+    auto palette = Theme::chrome_palette(*this);
+    QPainter painter { &image };
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(ChromeStyle::chrome_border(palette));
+    painter.setBrush(ChromeStyle::chrome_surface(palette));
+    auto rect = QRectF { QPointF {}, size }.adjusted(0.5, 0.5, -0.5, -0.5);
+    QPainterPath path;
+    path.moveTo(rect.bottomLeft());
+    if (m_hover_text_is_on_right) {
+        path.lineTo(rect.left(), rect.top() + HOVER_TEXT_CORNER_RADIUS);
+        path.arcTo(rect.left(), rect.top(), 2 * HOVER_TEXT_CORNER_RADIUS, 2 * HOVER_TEXT_CORNER_RADIUS, 180, -90);
+        path.lineTo(rect.topRight());
+    } else {
+        path.lineTo(rect.topLeft());
+        path.lineTo(rect.right() - HOVER_TEXT_CORNER_RADIUS, rect.top());
+        path.arcTo(rect.right() - 2 * HOVER_TEXT_CORNER_RADIUS, rect.top(), 2 * HOVER_TEXT_CORNER_RADIUS, 2 * HOVER_TEXT_CORNER_RADIUS, 90, -90);
+    }
+    path.lineTo(rect.bottomRight());
+    path.closeSubpath();
+    painter.drawPath(path);
+    painter.setFont(m_hover_label->font());
+    painter.setPen(ChromeStyle::chrome_text(palette));
+    painter.drawText(QRect { QPoint {}, size }, Qt::AlignCenter, text);
+    return image;
+}
+
+bool Tab::event(QEvent* event)
+{
+    if ((event->type() == QEvent::WindowActivate || event->type() == QEvent::WindowDeactivate) && is_loaded()) {
+        // An inactive window's toolbar icons drop to the muted color.
+        recreate_location_edit_icons();
+        update_permission_prompts();
+    }
+
+    if (event->type() == QEvent::PaletteChange && is_loaded()) {
+        update_chrome_style();
+        recreate_location_edit_icons();
+        if (m_is_loading)
+            update_tab_icon();
+        return QWidget::event(event);
+    }
+
+    return QWidget::event(event);
+}
+
+bool Tab::eventFilter(QObject* watched, QEvent* event)
+{
+    // NB: The hover text lets the pointer through, so it moves aside when the pointer comes near it.
+    if (watched == m_view && event->type() == QEvent::MouseMove && !m_hover_text.isEmpty()
+        && hover_text_belongs_on_right(static_cast<QMouseEvent*>(event)->position().toPoint()) != m_hover_text_is_on_right)
+        update_hover_label();
+    if (watched == m_view && (event->type() == QEvent::Resize || event->type() == QEvent::Move)) {
+        if (m_find_in_page->isVisible())
+            m_find_in_page->reposition();
+        m_window->reposition_page_cards();
+    }
+    if (watched == m_location_edit && event->type() == QEvent::DynamicPropertyChange && static_cast<QDynamicPropertyChangeEvent*>(event)->propertyName() == "autocompleteOpen")
+        m_view->set_suggestions_over_page(m_location_edit->property("autocompleteOpen").toBool());
+    return QWidget::eventFilter(watched, event);
+}
+
+void Tab::update_chrome_style()
+{
+    if (m_is_updating_chrome_style)
+        return;
+    m_is_updating_chrome_style = true;
+    auto hover_surface = ChromeStyle::style_sheet_color(ChromeStyle::chrome_surface(Theme::chrome_palette(*this)));
+    auto hover_border = ChromeStyle::style_sheet_color(ChromeStyle::chrome_border(Theme::chrome_palette(*this)));
+    auto hover_text = ChromeStyle::style_sheet_color(ChromeStyle::chrome_text(Theme::chrome_palette(*this)));
+    // NB: Only the corner toward the page is rounded. Setting a style sheet repolishes the label, even if unchanged.
+    auto hover_label_style = qformatted("background: {}; color: {}; border: 1px solid {}; border-top-{}-radius: {}px;",
+        hover_surface, hover_text, hover_border, m_hover_text_is_on_right ? "left" : "right", HOVER_TEXT_CORNER_RADIUS);
+    if (m_hover_label->styleSheet() != hover_label_style)
+        m_hover_label->setStyleSheet(hover_label_style);
+    m_is_updating_chrome_style = false;
+}
+
+void Tab::recreate_location_edit_icons()
+{
+    if (auto* action = m_location_edit->trailing_action()) {
+        auto engaged = view().toggle_bookmark_action().engaged();
+        action->setIcon(create_chrome_icon(engaged ? ChromeIcon::StarFilled : ChromeIcon::Star, Theme::chrome_palette(*this), ChromeStyle::window_activity(*this)));
+    }
+    if (m_translate_action)
+        m_translate_action->setIcon(create_translate_icon(Theme::chrome_palette(*this), view().is_translated()));
+}
+
+void Tab::show_translation_menu()
+{
+    if (!m_translation_menu) {
+        m_translation_menu = create_application_menu(*this, view().translation_menu());
+        m_location_edit->follow_translation_menu(*m_translation_menu);
+    }
+    auto& button = m_location_edit->translate_button();
+    m_translation_menu->popup(button.mapToGlobal(QPoint { 0, button.height() }));
+}
+
+void Tab::show_zoom_popover(QAction& zoom_level)
+{
+    if (!m_zoom_popover) {
+        auto* popover = new ZoomPopover(this, zoom_level);
+        popover->on_zoom_in = [this] { view().zoom_in(); };
+        popover->on_zoom_out = [this] { view().zoom_out(); };
+        popover->on_reset = [this] {
+            view().reset_zoom();
+            m_zoom_popover->close();
+        };
+        m_zoom_popover = popover;
+    }
+
+    auto& popover = *m_zoom_popover;
+    popover.setStyleSheet(ChromeStyle::zoom_popover_style_sheet(Theme::chrome_palette(*this)));
+    popover.adjustSize();
+    // The panel hangs from the address field, lined up with its right edge.
+    move_popover_below(popover, *m_location_edit);
+    popover.show();
+    move_popover_below(popover, *m_location_edit);
+}
+
+void Tab::show_bookmark_popover()
+{
+    auto& store = Application::bookmark_store();
+    auto just_added = BookmarkPopover::JustAdded::No;
+    auto bookmark = store.find_bookmark_by_url(view().url());
+    if (!bookmark.has_value()) {
+        Optional<String> title;
+        if (auto page_title = view().title().to_utf8(); !page_title.is_empty())
+            title = AK::move(page_title);
+        m_location_edit->animate_trailing_action_change(LocationEdit::TrailingActionMotion::Pop, [&] {
+            store.add_bookmark(view().url(), AK::move(title), view().favicon_hash());
+        });
+        bookmark = store.find_bookmark_by_url(view().url());
+        just_added = BookmarkPopover::JustAdded::Yes;
+    }
+    if (!bookmark.has_value())
+        return;
+
+    if (!m_bookmark_popover) {
+        m_bookmark_popover = new BookmarkPopover(this);
+        m_bookmark_popover->on_remove = [this](Function<void()> const& remove) {
+            m_location_edit->animate_trailing_action_change(LocationEdit::TrailingActionMotion::Fade, remove);
+        };
+        m_location_edit->follow_bookmark_popover(*m_bookmark_popover);
+    }
+    m_bookmark_popover->update_chrome_style(palette());
+    m_bookmark_popover->set_bookmark(bookmark->id, just_added);
+    auto& anchor = m_location_edit->trailing_action_button();
+    move_popover_below(*m_bookmark_popover, anchor);
+    m_bookmark_popover->show();
+    move_popover_below(*m_bookmark_popover, anchor);
+}
+
+void Tab::close_popovers()
+{
+    for (auto* popover : { static_cast<QWidget*>(m_private_session_popover), static_cast<QWidget*>(m_site_settings_popover), static_cast<QWidget*>(m_zoom_popover), static_cast<QWidget*>(m_bookmark_popover) }) {
+        if (popover)
+            popover->close();
+    }
+}
+
+// Settings are kept for websites, so a page that is not from one says why it has none.
+static QString explanation_for_page_without_site(URL::URL const& url)
+{
+    if (url.scheme() == "about"sv)
+        return QStringLiteral("Ladybird pages have no site settings.");
+    if (url.scheme() == "file"sv)
+        return QStringLiteral("Files on this computer have no site settings.");
+    // NB: A page from a website can still have no origin of its own to keep settings for, for example when its
+    //     Content-Security-Policy sandboxes it.
+    if (url.scheme().is_one_of("http"sv, "https"sv))
+        return QStringLiteral("This page has no site settings.");
+    return QStringLiteral("Pages that are not from a website have no site settings.");
+}
+
+void Tab::show_site_settings_popover()
+{
+    auto origin = view().permission_origin();
+
+    if (!m_site_settings_popover) {
+        m_site_settings_popover = new SiteSettingsPopover(this, Application::settings());
+        m_location_edit->follow_site_settings_popover(*m_site_settings_popover);
+        m_site_settings_popover->on_content_blocking_toggle = [this](bool enabled) {
+            auto snapshot = view().content_blocking_snapshot();
+            if (!snapshot.site.has_value() || !snapshot.can_toggle())
+                return;
+            if (Application::settings().set_content_blocker_enabled_for_site(*snapshot.site, enabled).is_error())
+                return;
+            view().reload();
+        };
+        m_site_settings_popover->on_open_all_site_settings = [this] {
+            m_window->new_tab_from_url(URL::Parser::basic_parse("about:settings#permissions"sv).release_value(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
+        };
+        m_site_settings_popover->on_report_broken_site = [] {
+            ApplicationActions::the().report_website_issue_action().activate();
+        };
+        m_site_settings_popover->on_open_filter_lists = [this] {
+            m_window->new_tab_from_url(URL::Parser::basic_parse("about:settings#blocking"sv).release_value(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_current_tab());
+        };
+        // A change reaches every page of the site at once, and the panel shows it right away. It applies to the site
+        // the panel was opened for: its menu runs a nested event loop, during which the tab may move on to another.
+        m_site_settings_popover->on_permission_change = [this](Web::Permissions::PermissionName name, Optional<WebView::PermissionDecision> decision) {
+            view().set_site_permission(*m_site_settings_popover_origin, name, decision);
+            refresh_site_settings_popover();
+        };
+        m_site_settings_popover->on_reset_permissions = [this] {
+            view().reset_site_permissions(*m_site_settings_popover_origin);
+            refresh_site_settings_popover();
+        };
+    }
+
+    m_site_settings_popover->update_chrome_style(palette());
+    if (origin.is_opaque()) {
+        // NB: The popover no longer shows the site it was last opened for.
+        m_site_settings_popover_origin = {};
+        m_site_settings_popover->set_page_without_site(title(), explanation_for_page_without_site(url()), m_favicon);
+    } else {
+        m_site_settings_popover_origin = origin;
+        m_site_settings_popover->set_site({
+            .origin = AK::move(origin),
+            .host_for_settings = view().current_host_for_settings(),
+            .is_private = view().is_private() == WebView::IsPrivate::Yes,
+            .favicon = m_favicon,
+            .content_blocking = view().content_blocking_snapshot(),
+            .permissions = view().site_permission_rows(),
+        });
+    }
+    move_popover_below(*m_site_settings_popover, site_settings_anchor(), PopoverAlignment::Leading);
+    m_site_settings_popover->show();
+    move_popover_below(*m_site_settings_popover, site_settings_anchor(), PopoverAlignment::Leading);
+    m_site_settings_popover->raise();
+}
+
+// What the popovers about a site hang from: the site settings button, or the field before the button is first shown.
+QWidget& Tab::site_settings_anchor() const
+{
+    auto& button = m_location_edit->site_settings_button();
+    return button.isVisible() ? button : static_cast<QWidget&>(*m_location_edit);
+}
+
+// The rows are read again for the site the panel was opened for; a panel whose tab has moved on to another site closes
+// instead, since its rows would be the new site's.
+void Tab::refresh_site_settings_popover()
+{
+    if (!m_site_settings_popover || !m_site_settings_popover_origin.has_value())
+        return;
+    if (!view().permission_origin().is_same_origin(*m_site_settings_popover_origin)) {
+        m_site_settings_popover->close();
+        return;
+    }
+    m_site_settings_popover->set_permissions(view().site_permission_rows());
+}
+
+void Tab::show_private_session_popover()
+{
+    if (m_window->is_private() == WebView::IsPrivate::No)
+        return;
+
+    if (!m_private_session_popover) {
+        m_private_session_popover = new MessagePopover(this, PRIVATE_SESSION_POPOVER_WIDTH, "Start a fresh private session?",
+            "This closes all private windows and deletes history and other site data from the current private browsing session.",
+            "Cancel", "Start fresh session");
+        m_private_session_popover->on_accept = [] {
+            Application::the().restart_private_browsing_session();
+        };
+    }
+
+    m_private_session_popover->update_chrome_style(palette());
+    position_private_session_popover();
+    m_private_session_popover->show();
+    position_private_session_popover();
+    m_private_session_popover->raise();
+}
+
+void Tab::position_private_session_popover()
+{
+    if (!m_private_session_popover)
+        return;
+
+    m_private_session_popover->adjustSize();
+
+    move_popover_below(*m_private_session_popover, m_window->ladybird_button(), PopoverAlignment::Leading, m_window->ladybird_button().tile_rect());
+}
+
+void Tab::show_find_in_page()
+{
+    m_find_in_page->setVisible(true);
+    m_find_in_page->focus_search_field();
+}
+
+void Tab::find_previous()
+{
+    m_find_in_page->find_previous();
+}
+
+void Tab::find_next()
+{
+    m_find_in_page->find_next();
+}
+
+void Tab::request_close()
+{
+    m_window->cancel_window_close_preflight();
+
+    // A tab that hasn't loaded has no page to ask, so it closes at once.
+    if (!is_loaded()) {
+        m_window->definitely_close_tab(tab_index());
+        return;
+    }
+
+    m_suppress_javascript_dialogs_until_navigation = true;
+    m_preserve_close_retry_state_on_dialog_dismissal = m_already_requested_close;
+    m_javascript_dialog->dismiss();
+    m_preserve_close_retry_state_on_dialog_dismissal = false;
+
+    if (!view().needs_beforeunload_check()) {
+        view().prepare_for_immediate_close();
+        m_window->definitely_close_tab(tab_index());
+        return;
+    }
+
+    // Prevent closing on first request so WebContent can cleanly shutdown (e.g. asking if the user is sure they want
+    // to leave, closing WebSocket connections, etc.)
+    if (!m_already_requested_close) {
+        m_already_requested_close = true;
+        view().request_close();
+        return;
+    }
+
+    // If the user has already requested a close, then respect the user's request and just close the tab.
+    // For example, the WebContent process may not be responding.
+    m_window->definitely_close_tab(tab_index());
+}
+
+void Tab::request_window_close_preflight(Function<void(bool)> on_complete)
+{
+    if (!is_loaded()) {
+        on_complete(true);
+        return;
+    }
+
+    m_suppress_javascript_dialogs_until_navigation = true;
+
+    if (m_javascript_dialog->type() != JavaScriptDialog::Type::BeforeUnload)
+        m_javascript_dialog->dismiss();
+
+    if (!view().needs_beforeunload_check()) {
+        on_complete(true);
+        return;
+    }
+
+    auto weak_this = QPointer<Tab>(this);
+    view().request_close_preflight([weak_this, on_complete = AK::move(on_complete)](bool approved) mutable {
+        if (!weak_this) {
+            on_complete(true);
+            return;
+        }
+        on_complete(approved);
+    });
+}
+
+void Tab::cancel_window_close_preflight()
+{
+    if (!is_loaded())
+        return;
+
+    if (m_javascript_dialog->type() == JavaScriptDialog::Type::BeforeUnload)
+        m_javascript_dialog->dismiss();
+    m_already_requested_close = false;
+    m_suppress_javascript_dialogs_until_navigation = false;
+}
+
+Function<void()> Tab::prepare_for_window_close()
+{
+    if (!is_loaded())
+        return [] { };
+
+    m_window_is_closing = true;
+    m_suppress_javascript_dialogs_until_navigation = true;
+    m_javascript_dialog->dismiss();
+    return view().prepare_for_close_without_prompting();
+}
+
+}

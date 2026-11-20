@@ -1,0 +1,71 @@
+name: 'Cache Save Action'
+description: 'Saves caches of build artifacts.'
+author: 'Andrew Kaster <akaster@serenityos.org>'
+
+inputs:
+  arch:
+    description: 'Target Architecture to restore caches for'
+    required: true
+  ccache_path:
+    description: 'Path to the ccache directory'
+    required: true
+  ccache_primary_key:
+    description: 'Primary ccache key'
+    required: true
+  sccache_path:
+    description: 'Path to the sccache directory'
+    required: true
+  sccache_primary_key:
+    description: 'Primary sccache key'
+    required: true
+  vcpkg_cache_path:
+    description: 'Path to the vcpkg binary cache directory'
+    required: true
+  vcpkg_cache_primary_key:
+    description: 'Primary vcpkg binary cache key, or empty to skip saving the vcpkg binary cache'
+    required: true
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 'Prune obsolete ccache files'
+      shell: bash
+      env:
+        CCACHE_DIR: ${{ inputs.ccache_path }}
+      run: |
+        ccache --evict-older-than=1d
+
+    - name: 'Compiler Cache'
+      if: ${{ github.ref == 'refs/heads/master' }}
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ inputs.ccache_path }}
+        key: ${{ inputs.ccache_primary_key }}
+
+    - name: 'Cache Stats'
+      shell: bash
+      env:
+        CCACHE_DIR: ${{ inputs.ccache_path }}
+      run: |
+        ccache -s
+
+    # Stopping the server gives its in-flight requests up to 10 seconds to finish, and prints the stats for the job's
+    # Rust compiles. It isn't running if nothing invoked it, or on Windows, where it doesn't outlive the build step.
+    - name: 'Stop the Rust compiler cache server'
+      shell: bash
+      run: |
+        sccache --stop-server || true
+
+    - name: 'Rust Compiler Cache'
+      if: ${{ github.ref == 'refs/heads/master' }}
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ inputs.sccache_path }}
+        key: ${{ inputs.sccache_primary_key }}
+
+    - name: 'vcpkg binary cache'
+      if: ${{ github.ref == 'refs/heads/master' && inputs.vcpkg_cache_primary_key != '' }}
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ inputs.vcpkg_cache_path }}
+        key: ${{ inputs.vcpkg_cache_primary_key }}

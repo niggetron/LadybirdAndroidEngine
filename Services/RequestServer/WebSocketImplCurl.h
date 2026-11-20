@@ -1,0 +1,54 @@
+/*
+ * Copyright (c) 2025, Andrew Kaster <andrew@ladybird.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/MemoryStream.h>
+#include <LibCore/Forward.h>
+#include <LibHTTP/Proxy.h>
+#include <LibWebSocket/Impl/WebSocketImpl.h>
+
+typedef void CURL;
+typedef void CURLM;
+struct curl_slist;
+
+namespace RequestServer {
+
+class WebSocketImplCurl final : public WebSocket::WebSocketImpl {
+public:
+    virtual ~WebSocketImplCurl() override;
+
+    static NonnullRefPtr<WebSocketImplCurl> create(CURLM*);
+
+    void set_proxy(Optional<HTTP::Proxy> proxy) { m_proxy = move(proxy); }
+
+    virtual void connect(WebSocket::ConnectionInfo const&) override;
+    virtual ErrorOr<ByteBuffer> read(int max_size) override;
+    virtual bool send(ReadonlyBytes) override;
+    virtual bool eof() override;
+    virtual void discard_connection() override;
+
+    bool did_connect();
+
+private:
+    explicit WebSocketImplCurl(CURLM*);
+
+    void read_from_socket();
+    bool flush_pending_write_buffer();
+
+    CURLM* m_multi_handle { nullptr };
+    Optional<HTTP::Proxy> m_proxy;
+    CURL* m_easy_handle { nullptr };
+    RefPtr<Core::Notifier> m_read_notifier;
+    RefPtr<Core::Notifier> m_write_notifier;
+    RefPtr<Core::Notifier> m_error_notifier;
+    Vector<curl_slist*> m_curl_string_lists;
+    AllocatingMemoryStream m_read_buffer;
+    ByteBuffer m_pending_write_buffer;
+    size_t m_pending_write_buffer_offset { 0 };
+};
+
+}

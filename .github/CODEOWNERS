@@ -1,0 +1,9 @@
+/Libraries/LibCrypto @alimpfard
+/Libraries/LibHTTP @alimpfard
+/Libraries/LibRegex @alimpfard
+/Libraries/LibTLS @alimpfard
+/Libraries/LibWasm @alimpfard
+/Libraries/LibWeb/WebAssembly @alimpfard
+/Libraries/LibXML @alimpfard
+/Services/RequestServer @alimpfard
+/Utilities/wasm.cpp @alimpfard

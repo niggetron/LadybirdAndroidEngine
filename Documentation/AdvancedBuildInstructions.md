@@ -1,0 +1,221 @@
+# Advanced Build Instructions
+
+This file covers a few advanced scenarios that go beyond what the basic build guide provides.
+
+## Ninja build targets
+
+The `Meta/ladybird.py` script provides an abstraction over the build targets which are made available by CMake. The
+following build targets cannot be accessed through the script and have to be used directly by changing the current
+directory to `Build/release` and then running `ninja <target>`:
+
+- `ninja check-style`: Runs the same linters the CI does to verify project style on changed files
+- `ninja lint-shell-scripts`: Checks style of shell scripts in the source tree with shellcheck
+- `ninja all_generated`: Builds all generated code. Useful for running analysis tools that can use compile_commands.json without a full system build
+
+When testing is enabled, the default build also compiles the main Rust
+workspace's test binaries and Flap's test targets on supported platforms.
+It does not run them. Use `ninja rust-tests` to compile just these Rust tests,
+or `ctest -R '^(RustWorkspace|Flap)$' --output-on-failure` to run the suites.
+
+## CMake build options
+
+There are some optional features that can be enabled during compilation that are intended to help with specific types of development work or introduce experimental features. Currently, the following build options are available:
+- `ENABLE_ADDRESS_SANITIZER`: builds in runtime checks for memory corruption bugs (like buffer overflows and memory leaks) in Lagom test cases.
+- `ENABLE_MEMORY_SANITIZER`: enables runtime checks for uninitialized memory accesses in Lagom test cases.
+- `ENABLE_UNDEFINED_SANITIZER`: builds in runtime checks for [undefined behavior](https://en.wikipedia.org/wiki/Undefined_behavior) (like null pointer dereferences and signed integer overflows) in Lagom and Ladybird.
+- `UNDEFINED_BEHAVIOR_IS_FATAL`: makes all undefined behavior sanitizer errors non-recoverable. This option reduces the performance overhead of `ENABLE_UNDEFINED_SANITIZER`.
+- `ENABLE_THREAD_SANITIZER`: enables runtime checks for data races. It cannot be combined with `ENABLE_ADDRESS_SANITIZER` or `ENABLE_MEMORY_SANITIZER`.
+- `ENABLE_LAGOM_COVERAGE_COLLECTION`: instruments the code for Clang's source-based code coverage. Requires Clang, and cannot be combined with the fuzzers.
+- `ENABLE_COMPILER_EXPLORER_BUILD`: skips building the utilities and tests.
+- `ENABLE_FUZZERS`: builds [fuzzers](../Meta/Fuzzers/README.md) for various parts of the system.
+- `ENABLE_FUZZERS_LIBFUZZER`: builds Clang libFuzzer-based [fuzzers](../Meta/Fuzzers/README.md) for various parts of the system.
+- `ENABLE_FUZZERS_OSSFUZZ`: builds OSS-Fuzz compatible [fuzzers](../Meta/Fuzzers/README.md) for various parts of the system.
+- `ENABLE_ALL_THE_DEBUG_MACROS`: used for checking whether debug code compiles on CI. This should not be set normally, as it clutters the console output and makes the system run very slowly. Instead, enable only the needed debug macros, as described below.
+- `ENABLE_COMPILETIME_FORMAT_CHECK`: checks for the validity of `std::format`-style format string during compilation. Enabled by default.
+- `ENABLE_JS_JIT`: builds the optimizing JIT for JavaScript. Enabled by default on x86-64 and AArch64 Linux and macOS and on x86-64 Windows, the platforms it generates code for. Without it, LibJS runs JavaScript in its interpreter alone, and the interpreter is built without the feedback collection and tier-up checks that only the JIT needs. See [the configuration of the JIT](../Libraries/LibJS/JIT/ARCHITECTURE.md#13-configuration).
+- `LADYBIRD_BASELINE_CPU_TARGET`: builds C++ and Rust for a common CPU target instead of the build machine. Disabled by default and enabled by the `Distribution` preset; explicitly set `-DLADYBIRD_BASELINE_CPU_TARGET=ON` when packaging binaries for older machines with another configuration. On x86-64 this is x86-64-v2 (SSE4.2 and POPCNT), so distributed binaries run without AVX, AVX2, BMI or LZCNT. Both the JavaScript and WebAssembly JITs remain available; WebAssembly selects newer instructions at runtime when supported.
+- `INCLUDE_WASM_SPEC_TESTS`: downloads and includes the WebAssembly spec testsuite tests. In order to use this option, you will need to install `prettier` and `wasm-tools`.
+- `BUILD_BROWSER_TESTS_ONLY`: only builds the tests that run the browser's own executables, such as the LibWeb test suite and the WebDriver tests, and leaves out the test programs for individual libraries. Enabled by the `Distribution` preset.
+- `LADYBIRD_CACHE_DIR`: sets the location of a shared cache of downloaded files. Should not need to be set manually unless managing a distribution package.
+- `ENABLE_NETWORK_DOWNLOADS`: allows downloading files from the internet during the build. Default on, turning off enables offline builds. For offline builds, the structure of the LADYBIRD_CACHE_DIR must be set up the way that the build expects.
+- `ENABLE_CLANG_PLUGINS`: enables Clang plugins which analyze the code for programming mistakes. See [Clang Plugins](#clang-plugins) below.
+- `ENABLE_CLANG_PLUGINS_INVALID_FUNCTION_MEMBERS`: makes the Clang plugins also detect invalid function types as members of GC-allocated objects. Only applies with `ENABLE_CLANG_PLUGINS`.
+- `BUILD_SHARED_LIBS`: builds shared libraries instead of static ones. Enabled by default, and disabled by the `Distribution` preset.
+- `ENABLE_GUI_TARGETS`: builds the browser, its helper processes and the tests that need them. Enabled by default.
+- `LADYBIRD_ENABLE_CCACHE`: compiles through ccache when it is installed. Enabled by default.
+- `LAGOM_USE_LINKER`: sets the linker to use, such as `lld` or `mold`, instead of the compiler's default. On Linux and the BSDs, LLD or mold is picked automatically when one of them is installed.
+- `LAGOM_LINK_POOL_SIZE`: sets the maximum number of link jobs that run at once.
+- `LADYBIRD_ENABLE_LTO`: enables link-time optimization. Disabled by default and enabled by the `Distribution` preset. Static builds with GCC need a lot of memory with it.
+- `LADYBIRD_ENABLE_CPPTRACE`: uses cpptrace for stack traces when it is available, and `backtrace.h` otherwise. Enabled by default.
+- `LADYBIRD_GENERATE_SYMBOL_FILES`: builds with debug information and writes the symbols of the installed executables to separate files. Enabled by the `Distribution` preset. Not supported with MSVC-style toolchains.
+- `LADYBIRD_GENERATE_DSYM`: generates dSYM bundles for executables and libraries on macOS.
+- `LADYBIRD_VERSION`: sets the version of a release, as three integers, such as `2026.46.0`. Empty for development builds.
+- `ENABLE_INSTALL_HEADERS`: installs the headers of the libraries. Enabled by default.
+- `ENABLE_INSTALL_FREEDESKTOP_FILES`: installs the desktop entry, D-Bus service, icon and AppStream metainfo files. Enabled by default on Linux and the BSDs.
+
+Many parts of the codebase have debug functionality, mostly consisting of additional messages printed to the debug console. This is done via the `<component_name>_DEBUG` macros, which can be enabled individually at build time. They are listed in [this file](../Meta/CMake/all_the_debug_macros.cmake).
+
+To toggle or change a build option, see the [CMake Cache Manipulation](#cmake-cache-manipulation) section below.
+
+## CMake Cache Manipulation
+
+CMake caches variables and options in the binary directory. This allows a developer to tailor variables that are `set()` within the persistent configuration cache.
+
+There are three main ways to manipulate the cache:
+- `cmake path/to/binary/dir -DVAR_NAME=Value`
+- `ccmake` (TUI interface)
+- `cmake-gui`
+
+Options can be set via the initial `cmake` invocation that creates the binary directory to set the initial cache for the binary directory.
+Once the binary directory exists, any of the three options above can be used to change the value of cache variables.
+
+For example, boolean options such as `ENABLE_<setting>` or `<component_name>_DEBUG` can be enabled with the value `ON` and disabled with `OFF`:
+
+```console
+# Reconfigure an existing binary directory with process debug enabled
+$ cmake -B Build/ladybird -DPROCESS_DEBUG=ON
+```
+
+For more information on how the CMake cache works, see the CMake guide for [Running CMake](https://cmake.org/runningcmake/). Additional context is available in the CMake documentation for
+[variables](https://cmake.org/cmake/help/latest/manual/cmake-language.7.html#variables) and [set()](https://cmake.org/cmake/help/latest/command/set.html#set-cache-entry).
+
+## Tests
+
+For information on running host and target tests, see [Testing](Testing.md). The documentation there also contains useful information for debugging CI test failures.
+
+## Clang-format updates
+
+Some OS distributions don't ship bleeding-edge clang-format binaries. Below are 2 options to acquire an updated clang-format tool, in order of preference:
+
+1) If you have a Debian-based (apt-based) distribution, use the [LLVM apt repositories](https://apt.llvm.org) to install the latest release of clang-format.
+2) Compile LLVM from source as described in the LLVM documentation [here](https://llvm.org/docs/GettingStarted.html#compiling-the-llvm-suite-source-code).
+
+## Clangd Configuration
+
+The repository has a `.clangd` configuration file in the root directory. One of the configuration stanzas in that file
+specifies the location for a compilation database. Depending on your build configuration (e.g. Release, Debug, Sanitizer),
+the path to the compilation database in that file may not be correct. You may edit the `.clangd` file to point at your
+build directory.
+
+## Clang Plugins
+
+Clang plugins are used to validate the code at compile time. Currently, they are used to detect JavaScript-related
+garbage collection faux pas, such as neglecting to visit a garbage-collected type.
+
+In order to enable Clang plugins, you will need Clang's development headers installed. For example, on Ubuntu this is
+the `libclang-dev` package.
+
+When Clang plugins are enabled, it is recommended to have the following environment variable set for ccache:
+
+```bash
+export CCACHE_COMPILERCHECK="%compiler% -v"
+```
+
+By default, ccache will include the plugins themselves in file hashes. So if a plugin changes, the hash of every file
+will change, and you will be stuck with an uncached build. This setting will prevent ccache from using plugins in the
+file hashes.
+
+## Building the Flatpak
+
+Ladybird has an in-tree Flatpak manifest that can be used to build a Flatpak package for Ladybird. The recommended way
+to build the Flatpak is to use the `flatpak-builder` tool, which is available in most distributions. See the
+[Flatpak setup documentation](https://flatpak.org/setup/) on how to configure your environment for user Flatpak
+builds, and to configure the Flathub repo. The Ladybird Flatpak manifest at
+`Meta/CMake/flatpak/org.ladybird.Ladybird.json` can be built with the following command:
+
+```bash
+flatpak-builder --user --force-clean --install-deps-from=flathub \
+  --ccache --repo=Build/repo --install Build/flatpak \
+  Meta/CMake/flatpak/org.ladybird.Ladybird.json
+```
+
+This command will build the Flatpak bundle and install it into the local Flatpak repository at `Build/repo`. Expect this
+to take a long time, as it will download and build all the dependencies of Ladybird as well. `flatpak-builder` will drop
+caches and build files in `.flatpak-builder`, as well as in the two subfolders `Build/repo` and `Build/flatpak`.
+
+The Flatpak can be run with the following command:
+
+```bash
+flatpak run --user org.ladybird.Ladybird
+```
+
+In order to debug the Flatpak, you can pass the `--devel` and `--command=sh` flags to `flatpak run`. This will drop you
+into a shell in the Flatpak sandbox:
+
+```bash
+flatpak run --user --command=sh --devel org.ladybird.Ladybird
+```
+
+## Debugging without any optimizations
+
+It’s possible that when trying to inspect certain frame variables in your debugger, you’ll get an error similar to the following:
+
+> error: Couldn't look up symbols: __ZN2AK6Detail10StringBaseD2Ev
+> Hint: The expression tried to call a function that is not present in the target, perhaps because it was optimized out by the compiler.
+
+If you do run into such an error, the rest of this section explains how to deal with it.
+
+> [!WARNING]
+> You probably only want to make the build-file change described below while you’re in the middle of examining the state of a particular build in your debugger — and then you’ll want to revert it after you’re done debugging. You otherwise probably don’t want to have the build-file change in place while you’re running WPT tests or in-tree tests and checking the results.
+
+1. At your command-line prompt in your shell environment, copy and paste the following:
+
+      ```diff
+      $ patch -p1 <<EOF
+      diff --git a/Meta/CMake/compile_options.cmake b/Meta/CMake/compile_options.cmake
+      index 0bb2be833b6..modified 100644
+      --- a/Meta/CMake/compile_options.cmake
+      +++ b/Meta/CMake/compile_options.cmake
+      @@ -235,7 +235,7 @@ if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+           if (NOT MSVC)
+               add_cxx_compile_options(-ggdb3)
+      -        add_cxx_compile_options(-Og)
+      +        add_cxx_compile_options(-O0)
+           endif()
+       elseif (CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+           if (NOT MSVC)
+      EOF
+      ```
+   …or else copy and paste that patch, and apply it in whatever way you normally use for applying patches.
+
+   That will patch the build config in such a way as to disable all compiler optimizations and make all debug symbols always available.
+
+2. At your command-line prompt in your shell environment, run the following command:
+
+      ```
+      git update-index --skip-worktree Meta/CMake/compile_options.cmake
+      ```
+
+   That will cause git to ignore the change you made to that build file. Otherwise, if you don’t run that command, git will consider that build file to have been modified, and you might then end up inadvertently committing the changes to that build file as part of some actual code change you’re making to the sources that you’re in the process of debugging.
+
+3. Run a build again with the `Debug` preset, and then go back into your debugger. You’ll now be able to inspect any frame variable that you weren’t able to previously.
+
+After you’ve finished debugging your code changes with that build, you can revert the above changes by doing this:
+
+1. At your command-line prompt in your shell environment, run the following:
+
+      ```
+      git update-index --no-skip-worktree Meta/CMake/compile_options.cmake \
+          && git checkout Meta/CMake/compile_options.cmake
+      ```
+
+That will restore your git environment to the state it was in before you patched the build file.
+
+## Debugging with Vulkan Validation Layers
+
+To turn on Vulkan validation layers for the release build, for example, use:
+
+```
+cmake -B Build/release -DVULKAN_VALIDATION_LAYERS_DEBUG=ON
+```
+
+and then build normally.
+
+When running Ladybird the message `Vulkan validation layers: active` will be visible during the creation of the VulkanContext if the Vulkan validation layers are properly setup.
+
+If instead `Vulkan validation layers: not available` appears then the system is most likely missing the validation layers. On Ubuntu adding the package `vulkan-validationlayers` will add them in, other distros may also have a package but the name could be different (for example, on Arch, Fedora and NixOS the name is `vulkan-validation-layers`.
+
+Another way to get the validation layers is to use the Vulkan SDK, for more info see:
+https://github.com/KhronosGroup/Vulkan-ValidationLayers
+
+If absolutely no output related to the Vulkan validation layers is received, then the initial `cmake` command in this section was not performed or the VulkanContext was not created successfully or was not created at all.

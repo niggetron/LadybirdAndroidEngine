@@ -1,0 +1,69 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/kmalloc.h>
+#include <QPoint>
+#include <QSize>
+#include <QString>
+#include <QToolButton>
+
+class QEnterEvent;
+class QEvent;
+class QMouseEvent;
+class QWidget;
+
+namespace Ladybird {
+
+enum class ControlButton {
+    Minimize,
+    Maximize,
+    Close,
+};
+
+class WindowControlButton final : public QToolButton {
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    WindowControlButton(ControlButton, QString const& tool_tip, QSize icon_size, QSize button_size, QWidget* parent = nullptr);
+
+    ControlButton type() const { return m_type; }
+
+    // GNOME draws its window controls as small circles, at the trailing end of the button's room.
+    void set_round(bool);
+
+private:
+    virtual void paintEvent(QPaintEvent*) override;
+    virtual void enterEvent(QEnterEvent*) override;
+    virtual void leaveEvent(QEvent*) override;
+    virtual void mouseMoveEvent(QMouseEvent*) override;
+    virtual void mouseDoubleClickEvent(QMouseEvent*) override;
+    virtual void mousePressEvent(QMouseEvent*) override;
+    virtual void mouseReleaseEvent(QMouseEvent*) override;
+
+    void reset_transient_state();
+    void set_pressed_outside(bool);
+    void update_pressed_position(QPoint const&);
+
+    ControlButton m_type;
+    bool m_tracking_press { false };
+    bool m_is_round { false };
+};
+
+struct WindowControlButtons {
+    QWidget* container { nullptr };
+    WindowControlButton* minimize { nullptr };
+    WindowControlButton* maximize { nullptr };
+    WindowControlButton* close { nullptr };
+};
+
+bool window_controls_on_left();
+void set_window_control_button_order(QWidget&, bool on_left);
+WindowControlButtons create_window_control_buttons(QWidget& parent, char const* object_name, QSize icon_size, QSize button_size);
+QWidget* create_window_controls_spacer(QWidget& parent, char const* object_name, QSize size);
+
+}

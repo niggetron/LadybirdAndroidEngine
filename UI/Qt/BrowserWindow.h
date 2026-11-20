@@ -1,0 +1,392 @@
+/*
+ * Copyright (c) 2022, Andreas Kling <andreas@ladybird.org>
+ * Copyright (c) 2023, Linus Groh <linusg@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <AK/Array.h>
+#include <AK/Optional.h>
+#include <AK/kmalloc.h>
+#include <LibURL/URL.h>
+#include <LibWebCommon/HTML/ActivateTab.h>
+#include <LibWebCommon/Page/PageId.h>
+#include <LibWebView/BrowsingSession.h>
+#include <LibWebView/Forward.h>
+#include <LibWebView/Settings.h>
+#include <UI/Qt/FullscreenDebounce.h>
+#include <UI/Qt/MacWindow.h>
+#include <UI/Qt/PageCard.h>
+#include <UI/Qt/SessionStore.h>
+#include <UI/Qt/Tab.h>
+#include <UI/Qt/TabBar.h>
+#include <UI/Qt/WindowCloseCoordinator.h>
+#include <UI/Qt/WindowScreenObserver.h>
+
+#include <QMainWindow>
+#include <QPushButton>
+
+class QIcon;
+class QPropertyAnimation;
+class QTimer;
+class QToolButton;
+class QWidget;
+class QWindow;
+
+namespace Ladybird {
+
+class MenuZoomRow;
+
+class Tab;
+class TabBarButton;
+class WebContentView;
+class BrowserWindow;
+class DevToolsBanner;
+
+class ExitFullscreenButton : public QPushButton {
+    Q_OBJECT
+
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    ExitFullscreenButton(QWidget* parent = nullptr);
+    ~ExitFullscreenButton() override = default;
+    void animate_show();
+    // The site that went full screen, which the toast names.
+    void set_host(QString);
+
+    virtual QSize sizeHint() const override;
+
+private:
+    virtual void paintEvent(QPaintEvent*) override;
+
+    QString m_host;
+    QPropertyAnimation* m_widget_animation;
+    QTimer* m_hide_timer { nullptr };
+};
+
+// Handles Qt UI state related to when Ladybird has entered fullscreen,
+// like displaying an exit button, listening for escape key presses and so on
+class FullscreenMode : public QObject {
+    Q_OBJECT
+
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    static constexpr int button_animation_time() { return 750; }
+    explicit FullscreenMode(BrowserWindow* window, ExitFullscreenButton* exit_button);
+
+    enum class ExitInitiatedBy {
+        UI,
+        WebContent,
+    };
+
+    // A page asking to leave names its tab, so a tab that already lost fullscreen can't end another tab's.
+    void exit(ExitInitiatedBy, Tab const* requesting_tab = nullptr);
+    void enter(Tab* tab);
+    // Called after a window change event that has identifed the current window state to be fullscreen. Tells the tab
+    // that asked for fullscreen that it has it.
+    void entered_fullscreen();
+    bool is_api_fullscreen() const;
+signals:
+    void on_exit_fullscreen();
+
+protected:
+    // FullscreenMode's eventFilter is responsible for things that need to happen when a document
+    // is in "fullscreen API fullscreen", like exiting when pushing escape, showing the exit button
+    virtual bool eventFilter(QObject* obj, QEvent* event) override;
+
+private:
+    // Called when in fullscreen. Displays exit fullscreen button if mouse comes close to the top of the screen.
+    void maybe_animate_show_exit_button(QPointF pos);
+    BrowserWindow* m_window;
+    ExitFullscreenButton* m_exit_button;
+    // Never access this directly. First check m_window->tab_index(m_fullscreen_tab) != -1, to verify it's liveness.
+    Tab* m_fullscreen_tab { nullptr };
+    FullscreenDebounce m_debounce;
+};
+
+class BrowserWindow
+    : public QMainWindow
+    , public WebView::SettingsObserver {
+    Q_OBJECT
+
+public:
+    AK_ALLOC_WITH_KMALLOC;
+
+    enum class IsPopupWindow {
+        No,
+        Yes,
+    };
+    class TabLocation {
+        friend class BrowserWindow;
+
+    private:
+        enum class Kind {
+            End,
+            AfterCurrentTab,
+            AfterTab,
+            AtIndex,
+        };
+
+    public:
+        static TabLocation end() { return { Kind::End, nullptr }; }
+        static TabLocation after_current_tab() { return { Kind::AfterCurrentTab, nullptr }; }
+        static TabLocation after_tab(Tab& tab) { return { Kind::AfterTab, &tab }; }
+        static TabLocation at_index(int index) { return { Kind::AtIndex, nullptr, index }; }
+
+    private:
+        Kind kind() const { return m_kind; }
+        Tab* tab() const { return m_tab; }
+        int index() const { return m_index; }
+
+        TabLocation(Kind kind, Tab* tab, int index = 0)
+            : m_kind(kind)
+            , m_tab(tab)
+            , m_index(index)
+        {
+        }
+
+        Kind m_kind;
+        Tab* m_tab { nullptr };
+        int m_index { 0 };
+    };
+
+    BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow is_popup_window = IsPopupWindow::No, WebView::IsPrivate = WebView::IsPrivate::No, Optional<u64> hub_view_id = {}, Optional<SessionWindowId> restored_session_window_id = {});
+    virtual ~BrowserWindow() override;
+
+    WebContentView& view() const { return m_current_tab->view(); }
+    WebView::IsPrivate is_private() const { return m_is_private; }
+    SessionStore& session() const;
+    Optional<WebView::HistoryEntry> history_entry_for_url(URL::URL const&) const;
+    Optional<SessionWindowId> session_window_id() const { return m_session_window_id; }
+
+    int tab_count() { return m_tabs_container->count(); }
+    int tab_index(Tab*);
+    Tab* tab_at(int index) const { return m_tabs_container->tab(index); }
+    TabWidget& tab_widget() const { return *m_tabs_container; }
+    WindowToolbar& toolbar() const { return m_tabs_container->toolbar(); }
+    BookmarksBar& bookmarks_bar() const { return m_tabs_container->bookmarks_bar(); }
+    // Closes a tab that isn't worth reopening, such as an empty tab that other tabs took the place of.
+    void close_tab_without_keeping_it(int index);
+
+    // Pinned tabs always fill the start of the strip: indices [0, pinned_tab_count()).
+    int pinned_tab_count() const;
+    // The tab joins the end of the pinned group, or the place in it that pinned_index gives.
+    void pin_tab(Tab&, Optional<int> pinned_index = {});
+    // The tab joins the start of the unpinned group.
+    void unpin_tab(Tab&);
+    void activate_first_unpinned_tab();
+
+    Tab& create_new_tab(Web::HTML::ActivateTab activate_tab, TabLocation);
+    void duplicate_tab(Tab&, Web::HTML::ActivateTab = Web::HTML::ActivateTab::Yes, Optional<i32> history_step = {});
+    void open_history_entry_in_new_tab(Tab&, int delta, Web::HTML::ActivateTab);
+    void update_tab_audio_button(Tab&);
+    // Opens a window's restored tabs, keeping the session rows the store re-adopted for them.
+    void restore_tabs(Vector<RestoredSessionTab> const&, i64 active_tab_index);
+    Tab* current_tab() const { return m_current_tab; }
+
+    enum class PageCardSlot : u8 {
+        RestoreSession,
+        Update,
+    };
+    void show_page_card(PageCardSlot, QString const& title, QString const& text, Vector<PageCard::Button>);
+    void reposition_page_cards();
+
+    Tab* activate_tab_with_url(URL::URL const&, URL::ExcludeFragment);
+    // Asks every tab's page if the window may close, without closing it, and reports the answer. Once the pages agree,
+    // a close() goes straight through.
+    void request_close_preflight(Function<void(bool approved)> on_complete);
+    // Brings the window forward for a page's beforeunload prompt during an application-wide close check.
+    void raise_for_close_prompt();
+    // Unminimizes, raises and activates the window, so the user sees it in front.
+    void bring_to_front();
+    // The tab showing this view, if it's one of this window's.
+    Tab* tab_for_view(RemoteView const&) const;
+    Tab& create_new_tab(Web::HTML::ActivateTab, Optional<u64> hub_view_id);
+    bool is_window_close_approved() const { return m_window_close_approved; }
+    void report_activation_to_session_store();
+    void cancel_window_close_preflight();
+    void on_tab_load_start(Tab&);
+    void on_tab_navigated_by_user(Tab&);
+    FullscreenMode& fullscreen_mode();
+
+    LadybirdButton& ladybird_button() const { return m_tabs_container->ladybird_button(); }
+    static bool has_chrome_in_titlebar();
+    void window_control_buttons_changed();
+
+    void show_window_context_menu(QPoint global_position);
+
+    template<typename Callback>
+    void for_each_tab(Callback&& callback)
+    {
+        for (int i = 0; i < m_tabs_container->count(); ++i) {
+            // A tab that hasn't loaded has no view or toolbar to update, and it picks up the window's toolbar and
+            // tab-bar state when it loads.
+            if (auto* tab = m_tabs_container->tab(i); tab->is_loaded())
+                callback(*tab);
+        }
+    }
+
+    void update_tabs_display();
+
+    void rebuild_bookmarks_menu();
+    enum class DetachedWindowFollowsPointer : bool {
+        No,
+        Yes,
+    };
+    BrowserWindow& detach_tab_to_new_window(int index, QPoint global_position, DetachedWindowFollowsPointer = DetachedWindowFollowsPointer::No);
+    void move_tab_to_window(int index, BrowserWindow& target_window, int target_index);
+    void adopt_tab(Tab&, int index);
+
+    // A download that failed marks the downloads button until the downloads are looked at.
+    void set_failed_download_count(size_t);
+    void acknowledge_failed_downloads();
+    bool has_unseen_failed_downloads() const { return m_failed_download_count > m_acknowledged_failed_download_count; }
+
+    double refresh_rate() const { return m_screen_observer->refresh_rate(); }
+    Optional<u64> display_id() const { return m_screen_observer->display_id(); }
+    bool screen_shows_high_dynamic_range() const { return m_screen_observer->screen_shows_high_dynamic_range(); }
+
+    void on_devtools_enabled();
+    void on_devtools_disabled();
+
+    void set_window_rect(Optional<Web::DevicePixels> x, Optional<Web::DevicePixels> y, Optional<Web::DevicePixels> width, Optional<Web::DevicePixels> height);
+    // Returns the rect made no larger than the bounds, and moved to be inside them.
+    static QRect rect_fitted_into(QRect, QRect const& bounds);
+    void place_popup_window(Web::HTML::WebViewHints const&, QScreen const& opener_screen);
+
+public slots:
+    void tab_title_changed(int index, QString const&);
+    void tab_favicon_changed(int index, QIcon const& icon);
+    void tab_audio_state_changed(int index);
+    Tab& new_tab_from_url(URL::URL const&, Web::HTML::ActivateTab, TabLocation);
+    void open_new_tab();
+    void activate_tab(int index);
+    bool definitely_close_tab(int index);
+    void move_tab(int old_index, int new_index);
+    void request_to_close_tab(int index);
+    void open_next_tab();
+    void open_previous_tab();
+    void show_all_tabs();
+    void move_focus_between_chrome_and_page();
+    void open_file();
+    void show_find_in_page();
+    void enter_fullscreen();
+    void exit_fullscreen();
+
+private:
+    bool close_tab(int index, SessionStore::KeepForReopening);
+    virtual bool event(QEvent*) override;
+    virtual bool eventFilter(QObject*, QEvent*) override;
+    virtual void resizeEvent(QResizeEvent*) override;
+    virtual void changeEvent(QEvent* event) override;
+    virtual void moveEvent(QMoveEvent*) override;
+    virtual void paintEvent(QPaintEvent*) override;
+    virtual void wheelEvent(QWheelEvent*) override;
+    virtual void closeEvent(QCloseEvent*) override;
+
+    virtual void appearance_changed() override;
+    virtual void config_variable_changed(WebView::ConfigVariableID) override;
+
+    Tab& create_restored_tab(RestoredSessionTab const&, int index, bool defer);
+    void initialize_tab(Tab*);
+    void initialize_tab_view(Tab*);
+    void uninitialize_tab(Tab*);
+    void update_window_title(QString const&);
+    void register_window_with_session_store();
+    void sync_session_tab_order();
+    void begin_window_close_preflight(Function<void(bool approved)> on_complete = {});
+
+    void set_current_tab(Tab* tab);
+    Qt::Edges resize_edges_for_position(QPoint const&) const;
+    Optional<Qt::CursorShape> resize_cursor_for_edges(Qt::Edges) const;
+    void update_resize_cursor(QPoint const&);
+    void refresh_resize_cursor_at_current_position(bool force_reapply = false);
+    void clear_resize_cursor();
+    bool should_draw_window_border() const;
+    void update_window_border();
+    void report_session_window_geometry();
+
+    void initialize_application_actions();
+    void initialize_application_menu();
+    void initialize_ladybird_menu();
+    void initialize_window_context_menu();
+
+    void update_chrome_style();
+
+    int constrain_insertion_index(int index, bool pinned) const;
+    void pinned_state_changed(Tab&);
+    TabBarButton* create_tab_close_button(Tab&);
+    void update_tab_close_button(Tab&);
+
+    void initialize_tab_buttons(Tab*);
+    void create_menu_bar_window_controls();
+    void update_tab_button_icons();
+    void update_menu_bar_visibility();
+    void update_menu_bar_window_control_icons();
+    void update_window_decoration_state();
+    static bool uses_client_side_decorations();
+    void toggle_window_maximized();
+    bool start_window_move();
+    void set_always_on_top(bool);
+
+    QIcon icon_for_page_mute_state(Tab&) const;
+    QString tool_tip_for_page_mute_state(Tab&) const;
+
+    WindowScreenObserver* m_screen_observer { nullptr };
+
+    WebView::IsPrivate m_is_private { WebView::IsPrivate::No };
+
+    TabWidget* m_tabs_container { nullptr };
+    Tab* m_current_tab { nullptr };
+    Array<QPointer<PageCard>, 2> m_page_cards;
+    QPointer<WebContentView> m_page_cards_view;
+    Vector<QPointer<Tab>> m_background_tabs_from_current_tab;
+    DevToolsBanner* m_devtools_banner { nullptr };
+
+    QWidget* m_menu_bar_window_controls { nullptr };
+    QToolButton* m_menu_bar_minimize_window_button { nullptr };
+    QToolButton* m_menu_bar_maximize_window_button { nullptr };
+    QToolButton* m_menu_bar_close_window_button { nullptr };
+
+    QMenu* m_ladybird_menu { nullptr };
+    MenuZoomRow* m_ladybird_menu_zoom_row { nullptr };
+
+    QMenu* m_window_context_menu { nullptr };
+    QAction* m_reopen_closed_tab_action { nullptr };
+    QAction* m_always_on_top_action { nullptr };
+    QActionGroup* m_tab_layout_actions { nullptr };
+
+    IsPopupWindow m_is_popup_window { IsPopupWindow::No };
+
+    Optional<SessionWindowId> m_session_window_id;
+    size_t m_failed_download_count { 0 };
+    size_t m_acknowledged_failed_download_count { 0 };
+    Optional<i64> m_window_close_active_tab_index;
+    bool m_window_was_fullscreen_before_page { false };
+    QPointer<Tab> m_window_close_original_active_tab;
+    QPointer<Tab> m_window_close_current_preflight_tab;
+    Vector<QPointer<Tab>> m_window_close_approved_tabs;
+    WindowCloseCoordinator m_window_close_coordinator;
+    Function<void(bool approved)> m_window_close_preflight_on_complete;
+    bool m_window_close_approved { false };
+
+    ExitFullscreenButton* m_exit_button { nullptr };
+    FullscreenMode* m_fullscreen_mode { nullptr };
+    // Determine if window should restore to maximized or normal, when exiting fullscreen.
+    bool m_resize_cursor_active { false };
+    // The widget the last left button press in the window landed on, so a double click can tell whether its first
+    // click landed on the same widget as its second.
+    QPointer<QWidget> m_last_left_press_widget;
+    u64 m_last_left_press_timestamp { 0 };
+    u64 m_last_double_click_timestamp { 0 };
+    bool m_double_click_started_elsewhere { false };
+#if defined(AK_OS_MACOS)
+    Optional<AppKitWindowChromeSnapshots> m_window_chrome_snapshots;
+#endif
+};
+
+}

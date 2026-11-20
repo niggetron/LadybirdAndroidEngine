@@ -1,0 +1,263 @@
+name: 'Setup action'
+description: 'Sets up shared CI tooling'
+author: 'Andrew Kaster <akaster@serenityos.org>'
+inputs:
+  os:
+    description: 'Operating System to set up'
+    required: true
+    default: 'Linux'
+  arch:
+    description: 'Target Architecture to set up'
+    required: true
+    default: 'x86_64'
+  toolchain:
+    description: 'Toolchain to use'
+    required: true
+    default: 'Clang'
+  type:
+    description: 'Whether the setup is for building or linting'
+    required: false
+    default: 'build'
+  build_preset:
+    description: 'When the setup is for building, set the build preset (e.g. Release)'
+    required: false
+    default: 'Release'
+  use_caches:
+    description: 'Whether to restore and save caches of downloaded files'
+    required: false
+    default: 'true'
+outputs:
+  ccache_path:
+    description: 'Path to the ccache directory'
+    value: ${{ steps.workspace.outputs.ccache_path }}
+  sccache_path:
+    description: 'Path to the sccache directory'
+    value: ${{ steps.workspace.outputs.sccache_path }}
+  vcpkg_cache_path:
+    description: 'Path to the vcpkg binary cache'
+    value: ${{ steps.workspace.outputs.vcpkg_cache_path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: 'Set workspace environment'
+      id: 'workspace'
+      shell: bash
+      run: |
+        echo "LADYBIRD_SOURCE_DIR=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+        echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache" >> "$GITHUB_ENV"
+        echo "ccache_path=${GITHUB_WORKSPACE}/.ccache" >> "$GITHUB_OUTPUT"
+        echo "SCCACHE_DIR=${GITHUB_WORKSPACE}/.sccache" >> "$GITHUB_ENV"
+        echo "SCCACHE_CACHE_SIZE=2G" >> "$GITHUB_ENV"
+        echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
+        echo "sccache_path=${GITHUB_WORKSPACE}/.sccache" >> "$GITHUB_OUTPUT"
+        echo "vcpkg_cache_path=${GITHUB_WORKSPACE}/Build/caches/vcpkg-binary-cache" >> "$GITHUB_OUTPUT"
+        echo "GIT_CONFIG_GLOBAL=${RUNNER_TEMP}/gitconfig" >> "$GITHUB_ENV"
+        git config --file "${RUNNER_TEMP}/gitconfig" --add safe.directory "${GITHUB_WORKSPACE}"
+        mkdir -p "${RUNNER_TEMP}/pip-cache"
+        echo "PIP_CACHE_DIR=${RUNNER_TEMP}/pip-cache" >> "$GITHUB_ENV"
+
+    - uses: actions/setup-python@v7
+      if: ${{ inputs.os != 'Linux' }}
+      with:
+        python-version: 3.12
+        cache: ${{ inputs.use_caches == 'true' && 'pip' || '' }}
+        cache-dependency-path: requirements.txt
+
+    # Use the system interpreter in Linux job containers: actions/setup-python can
+    # fail to find its tool-cache pip there.
+    - name: 'Set up Python environment'
+      shell: bash
+      run: |
+        python_bin=$(python3 "${GITHUB_WORKSPACE}/Meta/Utils/python_environment.py" --print-bin | tr -d '\r')
+        echo "${python_bin}" >> "$GITHUB_PATH"
+        echo "pythonLocation=$(dirname "${python_bin}")" >> "$GITHUB_ENV"
+
+    - name: 'Select latest Xcode'
+      if: ${{ inputs.os == 'macOS' || inputs.os == 'Android' }}
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: '27'
+
+    - name: 'Install Dependencies'
+      if: ${{ inputs.os == 'macOS' || inputs.os == 'Android' }}
+      shell: bash
+      run: |
+        brew update
+
+        brew unlink openssl@3 || true
+
+        brew install \
+            autoconf \
+            autoconf-archive \
+            automake \
+            bash \
+            ccache \
+            coreutils \
+            libtool \
+            llvm@22 \
+            nasm \
+            ninja \
+            pkg-config \
+            sccache \
+            unzip
+
+    - name: 'Install Dependencies'
+      if: ${{ inputs.os == 'Windows' }}
+      shell: bash
+      run: |
+        choco install -y sccache --no-progress
+
+        if ! where clang-cl > /dev/null 2>&1 ; then
+          # Keep the LLVM version in sync with GitHub's Windows runner image:
+          # https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md
+          choco install -y llvm --no-progress --version=20.1.8
+
+          echo "C:/Program Files/LLVM/bin" >> "${GITHUB_PATH}"
+          export PATH="/c/Program Files/LLVM/bin:${PATH}"
+        fi
+        clang-cl --version
+
+    - name: 'Install Rust toolchain'
+      if: ${{ inputs.os == 'macOS' || inputs.os == 'Android' }}
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: 'Warm up the Rust toolchain'
+      if: ${{ inputs.os == 'macOS' || inputs.os == 'Android' || inputs.os == 'Windows' }}
+      shell: bash
+      run: |
+        if rustup toolchain install && cargo --version && rustc --version ; then
+          exit 0
+        fi
+
+        # Some Blacksmith runner images boot with a partially installed toolchain. Either it has files rustup doesn't
+        # know about, which rustup can't repair on its own and fails on with a "detected conflict" error, or it lacks
+        # cargo or rustc although rustup reports the toolchain as installed. So wipe the toolchain and retry.
+        CHANNEL=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "${{ github.workspace }}/rust-toolchain.toml")
+        if [ -z "${CHANNEL}" ]; then
+          echo "Could not determine the pinned Rust channel" >&2
+          exit 1
+        fi
+
+        echo "Reinstalling Rust toolchain ${CHANNEL} from scratch"
+        rustup toolchain uninstall "${CHANNEL}" || rm -rf "$(rustup show home)/toolchains/${CHANNEL}"-*
+        rustup toolchain install
+        cargo --version
+        rustc --version
+
+    - name: 'Resolve wasm-tools release'
+      id: 'wasm-tools'
+      if: ${{ inputs.type == 'build' && inputs.os != 'Linux' }}
+      shell: bash
+      run: |
+        VERSION=1.243.0
+        if ${{ inputs.arch == 'arm64' }} ; then
+          ARCH=aarch64
+        else
+          ARCH=${{ inputs.arch }}
+        fi
+        LOWERCASE_OS=$( echo -n '${{ inputs.os }}' | tr '[:upper:]' '[:lower:]')
+        if ${{ inputs.os == 'Windows' }} ; then
+          EXTENSION=zip
+        else
+          EXTENSION=tar.gz
+        fi
+        NAME="wasm-tools-${VERSION}-${ARCH}-${LOWERCASE_OS}"
+        echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+        echo "filename=${NAME}.${EXTENSION}" >> "$GITHUB_OUTPUT"
+        echo "extension=${EXTENSION}" >> "$GITHUB_OUTPUT"
+
+    - name: 'Restore wasm-tools'
+      id: 'wasm-tools-cache'
+      if: ${{ inputs.use_caches == 'true' && inputs.type == 'build' && inputs.os != 'Linux' }}
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ github.workspace }}/wasm-tools
+        key: ${{ steps.wasm-tools.outputs.name }}
+
+    - name: 'Install wasm-tools'
+      if: ${{ inputs.type == 'build' && inputs.os != 'Linux' && steps.wasm-tools-cache.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: |
+        FILENAME="${{ steps.wasm-tools.outputs.filename }}"
+        URL="https://github.com/bytecodealliance/wasm-tools/releases/download/v${{ steps.wasm-tools.outputs.version }}/${FILENAME}"
+
+        delays=(5 15 45)
+        attempt=1
+        until curl --fail --location --output "${FILENAME}" "${URL}"; do
+          if (( attempt > ${#delays[@]} )); then
+            echo "wasm-tools download failed after $(( ${#delays[@]} + 1 )) attempts" >&2
+            exit 1
+          fi
+          echo "wasm-tools download failed; retrying in ${delays[attempt-1]}s" >&2
+          sleep "${delays[attempt-1]}"
+          attempt=$(( attempt + 1 ))
+        done
+
+        if [ "${{ steps.wasm-tools.outputs.extension }}" == 'zip' ]; then
+          unzip "${FILENAME}"
+        else
+          tar -xzf "${FILENAME}"
+        fi
+        rm "${FILENAME}"
+        mv "${{ steps.wasm-tools.outputs.name }}" wasm-tools
+
+    # Saved right after the install rather than by actions/cache's post-job step, which runs only if the whole job
+    # succeeds — so a flaky test would keep the cache from ever being saved.
+    - name: 'Save wasm-tools'
+      if: ${{ github.ref == 'refs/heads/master' && inputs.use_caches == 'true' && inputs.type == 'build' && inputs.os != 'Linux' && steps.wasm-tools-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ github.workspace }}/wasm-tools
+        key: ${{ steps.wasm-tools-cache.outputs.cache-primary-key }}
+
+    - name: 'Add wasm-tools to PATH'
+      if: ${{ inputs.type == 'build' && inputs.os != 'Linux' }}
+      shell: bash
+      run: echo "${GITHUB_WORKSPACE}/wasm-tools" >> "$GITHUB_PATH"
+
+    - name: 'Restore cargo registry'
+      id: 'cargo-registry'
+      if: ${{ inputs.use_caches == 'true' }}
+      uses: actions/cache/restore@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          /opt/cargo/registry
+        key: cargo-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Libraries/LibJS/Flap/Cargo.lock') }}
+        restore-keys: |
+          cargo-registry-${{ runner.os }}-
+
+    - name: 'Fetch cargo dependencies'
+      shell: bash
+      run: |
+        # Fetch every crate in both lockfiles, so the registry cache saved after this step is complete no matter
+        # which job saves it first, or which crates that job builds. Builds of older commits run this action from
+        # master, so skip any manifest that the checkout doesn't have.
+        for manifest in Cargo.toml Libraries/LibJS/Flap/Cargo.toml; do
+          if [ -f "${manifest}" ]; then
+            cargo fetch --locked --manifest-path "${manifest}"
+          fi
+        done
+
+    # Saved right after the fetch rather than by actions/cache's post-job step, which runs only if the whole job
+    # succeeds — so a flaky test would keep the cache from ever being saved.
+    - name: 'Save cargo registry'
+      if: ${{ github.ref == 'refs/heads/master' && inputs.use_caches == 'true' && steps.cargo-registry.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v6
+      with:
+        path: |
+          ~/.cargo/registry
+          /opt/cargo/registry
+        key: ${{ steps.cargo-registry.outputs.cache-primary-key }}
+
+    - name: 'Set required environment variables'
+      if: ${{ inputs.os == 'Linux' && inputs.arch == 'arm64' }}
+      shell: bash
+      run: echo "VCPKG_FORCE_SYSTEM_BINARIES=1" >> "$GITHUB_ENV"
+
+    - name: 'Install vcpkg'
+      if: ${{ inputs.type == 'build' }}
+      shell: bash
+      run: ./Meta/ladybird.py vcpkg --preset "${{ inputs.build_preset }}"
