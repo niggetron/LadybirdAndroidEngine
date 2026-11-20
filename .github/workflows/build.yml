@@ -67,6 +67,7 @@ jobs:
 
       - name: Set up vcpkg (Ladybird bootstrap)
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           for i in 1 2 3; do
             if python3 Meta/ladybird.py vcpkg --preset Release; then exit 0; fi
             echo "vcpkg bootstrap failed, retry $i"
