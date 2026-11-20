@@ -1,0 +1,48 @@
+/*
+ * Copyright (c) 2022, Linus Groh <linusg@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#pragma once
+
+#include <LibGC/Ptr.h>
+#include <LibJS/Forward.h>
+#include <LibJS/Heap/Cell.h>
+#include <LibWeb/Fetch/Infrastructure/HTTP/Responses.h>
+
+namespace Web::Fetch::Fetching {
+
+// Non-standard wrapper around a possibly pending Infrastructure::Response.
+// This is needed to fit the asynchronous nature of ResourceLoader into the synchronous expectations
+// of the Fetch spec - we run 'in parallel' as a deferred_invoke(), which is still on the main thread;
+// therefore we use callbacks to run portions of the spec that require waiting for an HTTP load.
+class PendingResponse : public JS::Cell {
+    GC_CELL(PendingResponse, JS::Cell);
+    GC_DECLARE_ALLOCATOR(PendingResponse);
+
+public:
+    using Callback = GC::Ref<GC::Function<void(NonnullRefPtr<Infrastructure::Response>)>>;
+
+    [[nodiscard]] static GC::Ref<PendingResponse> create(GC::Ref<Infrastructure::FetchController>);
+    [[nodiscard]] static GC::Ref<PendingResponse> create(GC::Ref<Infrastructure::FetchController>, NonnullRefPtr<Infrastructure::Response>);
+    [[nodiscard]] static GC::Ref<PendingResponse> create(Infrastructure::FetchParams const&);
+    [[nodiscard]] static GC::Ref<PendingResponse> create(Infrastructure::FetchParams const&, NonnullRefPtr<Infrastructure::Response>);
+
+    void when_loaded(Callback);
+    void resolve(NonnullRefPtr<Infrastructure::Response>);
+    bool is_resolved() const { return m_response != nullptr; }
+
+private:
+    PendingResponse(GC::Ref<Infrastructure::FetchController>, RefPtr<Infrastructure::Response> = {});
+
+    virtual void visit_edges(JS::Cell::Visitor&) override;
+
+    void run_callback();
+
+    GC::Ptr<GC::Function<void(NonnullRefPtr<Infrastructure::Response>)>> m_callback;
+    GC::Ref<Infrastructure::FetchController> m_fetch_controller;
+    RefPtr<Infrastructure::Response> m_response;
+};
+
+}

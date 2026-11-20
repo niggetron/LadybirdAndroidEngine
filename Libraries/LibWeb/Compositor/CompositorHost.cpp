@@ -1,0 +1,636 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/NonnullOwnPtr.h>
+#include <AK/Optional.h>
+#include <LibCompositing/DisplayList/Canvas2DCommandStream.h>
+#include <LibMediaCodecs/VideoFrame.h>
+#include <LibWeb/Compositor/CompositorConnection.h>
+#include <LibWeb/Compositor/CompositorHost.h>
+#include <LibWeb/Compositor/RenderClock.h>
+#include <LibWeb/HTML/Canvas/RemoteCanvas2DTransport.h>
+#include <LibWeb/WebGL/RemoteWebGLTransport.h>
+
+namespace Web::Compositor {
+
+CompositorContextHandle::CompositorContextHandle(CompositorHost& host, Web::CompositorContextId context_id)
+    : m_host(host)
+    , m_context_id(context_id)
+{
+}
+
+CompositorContextHandle::~CompositorContextHandle()
+{
+    m_host.destroy_context(m_context_id);
+}
+
+void CompositorContextHandle::set_parent_context(Optional<Web::CompositorContextId> parent_context_id)
+{
+    m_host.set_parent_context(m_context_id, parent_context_id);
+}
+
+void CompositorContextHandle::stop_presenting_to_client()
+{
+    m_host.stop_presenting_to_client(m_context_id);
+}
+
+bool CompositorContextHandle::ready_for_frame()
+{
+    m_host.flush_canvas_2d_stream();
+    return m_host.compositor_connection();
+}
+
+void CompositorContextHandle::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
+{
+    m_host.set_video_sink_ticking(video_sink_handle, should_tick);
+}
+
+void CompositorContextHandle::invalidate_keyboard_scroll_state(u64 generation)
+{
+    m_host.invalidate_keyboard_scroll_state(m_context_id, generation);
+}
+
+void CompositorContextHandle::invalidate_wheel_event_listener_state(u64 generation)
+{
+    m_host.invalidate_wheel_event_listener_state(m_context_id, generation);
+}
+
+Compositing::WheelEventAnswer CompositorContextHandle::take_wheel_event_from_main_thread(Web::MouseEvent const& event, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelEventRouting routing)
+{
+    return m_host.take_wheel_event_from_main_thread(m_context_id, event, operation_tracking, routing);
+}
+
+Compositing::WheelEventAnswer CompositorContextHandle::wheel_event_let_through(Compositing::WheelStepLetThrough const& step, Compositing::AsyncScrollOperationTracking operation_tracking)
+{
+    return m_host.wheel_event_let_through(m_context_id, step, operation_tracking);
+}
+
+void CompositorContextHandle::wheel_event_canceled(u64 wheel_gesture_id)
+{
+    m_host.wheel_event_canceled(m_context_id, wheel_gesture_id);
+}
+
+String CompositorContextHandle::scroll_state_for_testing(Web::AsyncScrollNodeStableID stretched_scroller)
+{
+    return m_host.scroll_state_for_testing(m_context_id, stretched_scroller);
+}
+
+void CompositorContextHandle::synchronize_for_testing()
+{
+    m_host.synchronize_for_testing();
+}
+
+Optional<Compositing::FirstWheelStepRouteForTesting> CompositorContextHandle::route_first_wheel_step_for_testing(Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels)
+{
+    return m_host.route_first_wheel_step_for_testing(m_context_id, position, delta_in_css_pixels);
+}
+
+void CompositorContextHandle::begin_input_trace_for_testing()
+{
+    m_host.begin_input_trace_for_testing(m_context_id);
+}
+
+void CompositorContextHandle::clear_per_test_input_state_for_testing()
+{
+    m_host.clear_per_test_input_state_for_testing(m_context_id);
+}
+
+Vector<Web::InputTraceRecord> CompositorContextHandle::take_input_trace_for_testing()
+{
+    return m_host.take_input_trace_for_testing(m_context_id);
+}
+
+Compositing::PendingAsyncScrollUpdates CompositorContextHandle::take_pending_async_scroll_updates(Compositing::AsyncScrollUpdateFreshness freshness)
+{
+    return m_host.take_pending_async_scroll_updates(m_context_id, freshness);
+}
+
+void CompositorContextHandle::viewport_size_updated(Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
+{
+    m_host.viewport_size_updated(m_context_id, viewport_size, device_pixel_ratio, window_resize_in_progress);
+}
+
+bool CompositorContextHandle::request_rendering_opportunity(double maximum_frames_per_second)
+{
+    return m_host.request_rendering_opportunity(m_context_id, maximum_frames_per_second);
+}
+
+void CompositorContextHandle::hurry_rendering_opportunity()
+{
+    m_host.hurry_rendering_opportunity(m_context_id);
+}
+
+void CompositorContextHandle::request_screenshot(NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void(ScreenshotResult)>&& callback)
+{
+    m_host.flush_canvas_2d_stream();
+    m_host.request_screenshot(m_context_id, move(target_bitmap), move(callback));
+}
+
+void CompositorContextHandle::prepare_remote_descendants_for_screenshot(Function<void()>&& callback)
+{
+    m_host.prepare_remote_descendants_for_screenshot(m_context_id, move(callback));
+}
+
+CompositorHost::CompositorHost()
+    : m_canvas_2d_stream(adopt_ref(*new Compositing::Canvas2DCommandStream()))
+{
+}
+
+CompositorHost::~CompositorHost() = default;
+
+OwnPtr<CompositorContextHandle> CompositorHost::create_context(Web::CompositorContextId context_id)
+{
+    return adopt_own(*new CompositorContextHandle(*this, context_id));
+}
+
+void CompositorHost::flush_canvas_2d_stream()
+{
+    if (m_canvas_2d_stream->is_empty())
+        return;
+    send_canvas_2d_stream(*m_canvas_2d_stream);
+}
+
+void CompositorHost::discard_canvas_2d_stream()
+{
+    (void)m_canvas_2d_stream->take_segments();
+    (void)m_canvas_2d_stream->take_image_frames();
+    (void)m_canvas_2d_stream->take_video_frame_holds();
+}
+
+class CompositorRemoteWebGLTransport final : public Web::WebGL::RemoteWebGLTransport {
+public:
+    explicit CompositorRemoteWebGLTransport(NonnullRefPtr<CompositorConnection> connection)
+        : m_connection(move(connection))
+    {
+    }
+
+private:
+    virtual CreateResult create_context(Compositing::WebGL::WebGLVersion webgl_version, Gfx::IntSize initial_size, bool depth, bool stencil, bool antialias) override
+    {
+        VERIFY(!m_canvas_id.has_value());
+        CreateResult result;
+        auto canvas_id = m_connection->create_webgl_context(webgl_version, initial_size, depth, stencil, antialias, result.supported_extensions);
+        if (canvas_id.has_value()) {
+            result.success = true;
+            m_canvas_id = *canvas_id;
+        }
+        return result;
+    }
+
+    virtual Optional<Compositing::CanvasId> canvas_id() const override
+    {
+        return m_canvas_id;
+    }
+
+    virtual void destroy_context() override
+    {
+        if (!m_canvas_id.has_value())
+            return;
+        m_connection->destroy_canvas_context(*m_canvas_id);
+        m_canvas_id.clear();
+    }
+
+    virtual void set_shared_command_buffer(Core::AnonymousBuffer const& command_buffer) override
+    {
+        if (!m_canvas_id.has_value())
+            return;
+        m_connection->set_webgl_command_buffer(*m_canvas_id, command_buffer);
+    }
+
+    virtual void send_commands_from_shared_buffer(u64 offset, u64 size_in_bytes, u64 flush_sequence_number, Vector<Compositing::WebGL::ImageSourceFrame> const& frames) override
+    {
+        if (!m_canvas_id.has_value())
+            return;
+        m_connection->send_webgl_commands_from_shared_buffer(*m_canvas_id, offset, size_in_bytes, flush_sequence_number, frames);
+    }
+
+    virtual bool wait_until_published_commands_executed() override
+    {
+        if (!m_canvas_id.has_value())
+            return false;
+        return m_connection->drain_webgl_command_buffer(*m_canvas_id);
+    }
+
+    virtual void send_commands(ReadonlyBytes commands, Vector<Compositing::WebGL::ImageSourceFrame> const& frames) override
+    {
+        if (!m_canvas_id.has_value())
+            return;
+        m_connection->send_webgl_commands(*m_canvas_id, commands, frames);
+    }
+
+    virtual void present_canvas(bool preserve_drawing_buffer) override
+    {
+        if (!m_canvas_id.has_value())
+            return;
+        m_connection->present_webgl_canvas(*m_canvas_id, preserve_drawing_buffer);
+    }
+
+    virtual void clear_drawing_buffer() override
+    {
+        if (!m_canvas_id.has_value())
+            return;
+        m_connection->clear_webgl_drawing_buffer(*m_canvas_id);
+    }
+
+    virtual ByteBuffer sync_call(ByteBuffer request) override
+    {
+        if (!m_canvas_id.has_value())
+            return {};
+        return m_connection->webgl_sync_call(*m_canvas_id, move(request));
+    }
+
+    virtual Compositing::WebGL::ReadPixelsResult read_pixels_robust_angle(Compositing::WebGL::GLint x, Compositing::WebGL::GLint y, Compositing::WebGL::GLsizei width, Compositing::WebGL::GLsizei height, Compositing::WebGL::GLenum format, Compositing::WebGL::GLenum type, Compositing::WebGL::GLsizei buf_size, Core::AnonymousBuffer pixels) override
+    {
+        if (!m_canvas_id.has_value())
+            return {};
+        return m_connection->read_webgl_pixels(*m_canvas_id, x, y, width, height, format, type, buf_size, pixels);
+    }
+
+    virtual bool read_buffer_sub_data(Compositing::WebGL::GLenum target, Compositing::WebGL::GLintptr offset, Compositing::WebGL::GLintptr size, Core::AnonymousBuffer data) override
+    {
+        if (!m_canvas_id.has_value())
+            return false;
+        return m_connection->read_webgl_buffer_sub_data(*m_canvas_id, target, offset, size, data);
+    }
+
+    virtual Gfx::ShareableBitmap read_back_drawing_buffer(Gfx::IntRect const& rect) override
+    {
+        if (!m_canvas_id.has_value())
+            return {};
+        return m_connection->get_canvas_pixels(*m_canvas_id, rect);
+    }
+
+    NonnullRefPtr<CompositorConnection> m_connection;
+    Optional<Compositing::CanvasId> m_canvas_id;
+};
+
+class CompositorRemoteCanvas2DTransport final : public Web::HTML::RemoteCanvas2DTransport {
+public:
+    CompositorRemoteCanvas2DTransport(NonnullRefPtr<CompositorConnection> connection, NonnullRefPtr<Compositing::Canvas2DCommandStream> stream)
+        : m_connection(move(connection))
+        , m_stream(move(stream))
+    {
+    }
+
+private:
+    virtual bool create_context(Gfx::IntSize size, bool alpha, bool will_read_frequently, Gfx::ColorSpace const& color_space) override
+    {
+        VERIFY(!m_canvas_id.has_value());
+        auto canvas_id = m_connection->create_canvas_2d_context(size, alpha, will_read_frequently, color_space);
+        if (!canvas_id.has_value())
+            return false;
+        m_canvas_id = *canvas_id;
+        return true;
+    }
+
+    virtual Optional<Compositing::CanvasId> canvas_id() const override
+    {
+        return m_canvas_id;
+    }
+
+    virtual void destroy_context() override
+    {
+        if (!m_canvas_id.has_value())
+            return;
+        m_connection->destroy_canvas_context(*m_canvas_id);
+        m_canvas_id.clear();
+    }
+
+    virtual void append_command(ReadonlyBytes record) override
+    {
+        VERIFY(m_canvas_id.has_value());
+        m_stream->append_command(*m_canvas_id, record);
+    }
+
+    virtual Compositing::FontResourceId add_font(Gfx::Font const& font) override
+    {
+        return m_stream->add_font(font);
+    }
+
+    virtual Compositing::ImageFrameResourceId add_image_frame(Gfx::DecodedImageFrame const& frame) override
+    {
+        return m_stream->add_image_frame(frame);
+    }
+
+    virtual void retain_video_frame_hold(NonnullRefPtr<Compositing::VideoFrameHold> hold) override
+    {
+        m_stream->retain_video_frame_hold(move(hold));
+    }
+
+    virtual void record_present() override
+    {
+        VERIFY(m_canvas_id.has_value());
+        m_stream->record_present(*m_canvas_id);
+    }
+
+    virtual size_t pending_command_count() const override
+    {
+        return m_stream->total_command_count();
+    }
+
+    virtual void flush() override
+    {
+        m_connection->update_canvas_2d_stream(*m_stream);
+    }
+
+    virtual Optional<Gfx::DecodedImageFrame> read_back_pixels(Gfx::IntRect const& rect, Gfx::AlphaType alpha_type, Gfx::ColorSpace const& color_space) override
+    {
+        if (!m_canvas_id.has_value())
+            return {};
+        auto shareable_bitmap = m_connection->get_canvas_pixels(*m_canvas_id, rect, alpha_type, color_space);
+        if (!shareable_bitmap.is_valid())
+            return {};
+        auto frame = Gfx::DecodedImageFrame::create(*shareable_bitmap.bitmap(), color_space);
+        if (frame.is_error())
+            return {};
+        return frame.release_value();
+    }
+
+    NonnullRefPtr<CompositorConnection> m_connection;
+    NonnullRefPtr<Compositing::Canvas2DCommandStream> m_stream;
+    Optional<Compositing::CanvasId> m_canvas_id;
+};
+
+RefPtr<Web::WebGL::RemoteWebGLTransport> CompositorHost::create_webgl_transport()
+{
+    if (auto* connection = compositor_connection())
+        return adopt_ref(*new CompositorRemoteWebGLTransport(*connection));
+    return nullptr;
+}
+
+RefPtr<Web::HTML::RemoteCanvas2DTransport> CompositorHost::create_canvas_2d_transport()
+{
+    if (auto* connection = compositor_connection())
+        return adopt_ref(*new CompositorRemoteCanvas2DTransport(*connection, canvas_2d_stream()));
+    return nullptr;
+}
+
+Optional<Web::Compositor::PlaceholderCanvasLink> CompositorHost::allocate_placeholder_canvas()
+{
+    if (auto* connection = compositor_connection())
+        return connection->allocate_placeholder_canvas();
+    return {};
+}
+
+void CompositorHost::release_placeholder_canvas(Compositing::CanvasId canvas_id)
+{
+    if (auto* connection = compositor_connection())
+        connection->release_placeholder_canvas(canvas_id);
+}
+
+void CompositorHost::commit_placeholder_canvas(Web::Compositor::PlaceholderCanvasLink link, Optional<Compositing::CanvasId> source_canvas_id, Gfx::IntSize size, bool origin_clean)
+{
+    if (auto* connection = compositor_connection())
+        connection->commit_placeholder_canvas(link, source_canvas_id, size, origin_clean);
+}
+
+Web::Compositor::PlaceholderCanvasPixels CompositorHost::read_placeholder_canvas_pixels(Compositing::CanvasId canvas_id, Gfx::IntRect rect)
+{
+    if (auto* connection = compositor_connection())
+        return connection->get_placeholder_canvas_pixels(canvas_id, rect);
+    return {};
+}
+
+void CompositorHost::send_canvas_2d_stream(Compositing::Canvas2DCommandStream& stream)
+{
+    if (auto* connection = compositor_connection())
+        connection->update_canvas_2d_stream(stream);
+}
+
+bool CompositorHost::rasterize_image(Layout::RustFFI::FfiImageRasterization const& image, NonnullRefPtr<Gfx::Bitmap> target) const
+{
+    auto* connection = compositor_connection();
+    if (!connection)
+        return false;
+    return connection->rasterize_image(image, move(target));
+}
+
+bool CompositorHost::rasterize_last_recording(Layout::RustFFI::DocumentHost const& document_host, Layout::BegunRead const& read, NonnullRefPtr<Gfx::Bitmap> target) const
+{
+    auto* connection = compositor_connection();
+    if (!connection)
+        return false;
+    return connection->rasterize_last_recording(document_host, read, move(target));
+}
+
+void CompositorHost::destroy_context(Web::CompositorContextId context_id)
+{
+    if (auto* connection = compositor_connection()) {
+        connection->destroy_context(context_id);
+        // A connection attached the render clock, whose lanes of the context hear of it no more.
+        RenderClock::the().forget_context(context_id);
+    }
+    context_was_destroyed(context_id);
+}
+
+void CompositorHost::set_parent_context(Web::CompositorContextId context_id, Optional<Web::CompositorContextId> parent_context_id)
+{
+    if (auto* connection = compositor_connection())
+        connection->set_parent_context(context_id, parent_context_id);
+}
+
+void CompositorHost::stop_presenting_to_client(Web::CompositorContextId context_id)
+{
+    if (auto* connection = compositor_connection())
+        connection->stop_presenting_to_client(context_id);
+}
+
+void CompositorHost::add_animated_image(u64 frame_id, AnimatedImageRegistration image)
+{
+    if (auto* connection = compositor_connection())
+        connection->add_animated_image(frame_id, image);
+    m_animated_images.set(frame_id, move(image));
+}
+
+void CompositorHost::remove_animated_image(u64 frame_id)
+{
+    m_animated_images.remove(frame_id);
+    if (auto* connection = compositor_connection())
+        connection->remove_animated_image(frame_id);
+}
+
+void CompositorHost::start_animated_image(u64 frame_id)
+{
+    m_animated_images.get(frame_id)->is_started = true;
+    if (auto* connection = compositor_connection())
+        connection->start_animated_image(frame_id);
+}
+
+void CompositorHost::stop_animated_image(u64 frame_id)
+{
+    m_animated_images.get(frame_id)->is_started = false;
+    if (auto* connection = compositor_connection())
+        connection->stop_animated_image(frame_id);
+}
+
+AnimatedImageState CompositorHost::animated_image_state_for_testing(u64 frame_id) const
+{
+    if (auto* connection = compositor_connection())
+        return connection->animated_image_state_for_testing(frame_id);
+    return {};
+}
+
+void CompositorHost::register_animated_images_with_new_compositor()
+{
+    auto* connection = compositor_connection();
+    if (!connection)
+        return;
+    for (auto const& [frame_id, image] : m_animated_images) {
+        connection->add_animated_image(frame_id, image);
+        if (image.is_started)
+            connection->start_animated_image(frame_id);
+    }
+}
+
+bool CompositorHost::add_video_sink(Media::VideoSinkHandle video_sink_handle, NonnullRefPtr<Compositing::VideoFramePresentationPage> presentation_page)
+{
+    auto* connection = compositor_connection();
+    if (!connection)
+        return false;
+    connection->add_video_sink(video_sink_handle, move(presentation_page));
+    return true;
+}
+
+void CompositorHost::remove_video_sink(Media::VideoSinkHandle video_sink_handle)
+{
+    if (auto* connection = compositor_connection())
+        connection->remove_video_sink(video_sink_handle);
+}
+
+void CompositorHost::set_video_sink_ticking(Media::VideoSinkHandle video_sink_handle, bool should_tick)
+{
+    if (auto* connection = compositor_connection())
+        connection->set_video_sink_ticking(video_sink_handle, should_tick);
+}
+
+Compositing::VideoFrameHold::ReleaseThroughCompositor CompositorHost::video_frame_hold_releaser_for_current_connection() const
+{
+    auto* connection = compositor_connection();
+    if (!connection)
+        return {};
+    return [weak_connection = connection->make_weak_ptr<CompositorConnection>()](Media::VideoSinkHandle video_sink_handle, u64 generation) {
+        if (auto connection = weak_connection.strong_ref())
+            connection->release_video_frame_hold(video_sink_handle, generation);
+    };
+}
+
+void CompositorHost::invalidate_keyboard_scroll_state(Web::CompositorContextId context_id, u64 generation)
+{
+    if (auto* connection = compositor_connection())
+        connection->invalidate_keyboard_scroll_state(context_id, generation);
+}
+
+void CompositorHost::invalidate_wheel_event_listener_state(Web::CompositorContextId context_id, u64 generation)
+{
+    if (auto* connection = compositor_connection())
+        connection->invalidate_wheel_event_listener_state(context_id, generation);
+}
+
+Compositing::WheelEventAnswer CompositorHost::take_wheel_event_from_main_thread(Web::CompositorContextId context_id, Web::MouseEvent const& event, Compositing::AsyncScrollOperationTracking operation_tracking, Compositing::WheelEventRouting routing)
+{
+    if (auto* connection = compositor_connection())
+        return connection->take_wheel_event_from_main_thread(context_id, event, operation_tracking, routing);
+    return {};
+}
+
+Compositing::WheelEventAnswer CompositorHost::wheel_event_let_through(Web::CompositorContextId context_id, Compositing::WheelStepLetThrough const& step, Compositing::AsyncScrollOperationTracking operation_tracking)
+{
+    if (auto* connection = compositor_connection())
+        return connection->wheel_event_let_through(context_id, step, operation_tracking);
+    return {};
+}
+
+void CompositorHost::wheel_event_canceled(Web::CompositorContextId context_id, u64 wheel_gesture_id)
+{
+    if (auto* connection = compositor_connection())
+        connection->wheel_event_canceled(context_id, wheel_gesture_id);
+}
+
+String CompositorHost::scroll_state_for_testing(Web::CompositorContextId context_id, Web::AsyncScrollNodeStableID stretched_scroller)
+{
+    if (auto* connection = compositor_connection())
+        return connection->scroll_state_for_testing(context_id, stretched_scroller);
+    return {};
+}
+
+void CompositorHost::synchronize_for_testing()
+{
+    if (auto* connection = compositor_connection())
+        connection->synchronize_for_testing();
+}
+
+Optional<Compositing::FirstWheelStepRouteForTesting> CompositorHost::route_first_wheel_step_for_testing(Web::CompositorContextId context_id, Gfx::FloatPoint position, Gfx::FloatPoint delta_in_css_pixels)
+{
+    if (auto* connection = compositor_connection())
+        return connection->route_first_wheel_step_for_testing(context_id, position, delta_in_css_pixels);
+    return {};
+}
+
+void CompositorHost::begin_input_trace_for_testing(Web::CompositorContextId context_id)
+{
+    if (auto* connection = compositor_connection())
+        connection->begin_input_trace_for_testing(context_id);
+}
+
+void CompositorHost::clear_per_test_input_state_for_testing(Web::CompositorContextId context_id)
+{
+    if (auto* connection = compositor_connection())
+        connection->clear_per_test_input_state_for_testing(context_id);
+}
+
+Vector<Web::InputTraceRecord> CompositorHost::take_input_trace_for_testing(Web::CompositorContextId context_id)
+{
+    if (auto* connection = compositor_connection())
+        return connection->take_input_trace_for_testing(context_id);
+    return {};
+}
+
+Compositing::PendingAsyncScrollUpdates CompositorHost::take_pending_async_scroll_updates(Web::CompositorContextId context_id, Compositing::AsyncScrollUpdateFreshness freshness)
+{
+    if (auto* connection = compositor_connection())
+        return connection->take_pending_async_scroll_updates(context_id, freshness);
+    return {};
+}
+
+void CompositorHost::viewport_size_updated(Web::CompositorContextId context_id, Gfx::IntSize viewport_size, double device_pixel_ratio, Compositing::WindowResizingInProgress window_resize_in_progress)
+{
+    if (auto* connection = compositor_connection())
+        connection->viewport_size_updated(context_id, viewport_size, device_pixel_ratio, window_resize_in_progress);
+}
+
+bool CompositorHost::request_rendering_opportunity(Web::CompositorContextId context_id, double maximum_frames_per_second)
+{
+    if (auto* connection = compositor_connection())
+        return connection->request_rendering_opportunity(context_id, maximum_frames_per_second);
+    return false;
+}
+
+void CompositorHost::hurry_rendering_opportunity(Web::CompositorContextId context_id)
+{
+    if (auto* connection = compositor_connection())
+        connection->hurry_rendering_opportunity(context_id);
+}
+
+void CompositorHost::prepare_remote_descendants_for_screenshot(Web::CompositorContextId context_id, Function<void()>&& callback)
+{
+    if (auto* connection = compositor_connection()) {
+        connection->prepare_remote_descendants_for_screenshot(context_id, move(callback));
+        return;
+    }
+    callback();
+}
+
+void CompositorHost::request_screenshot(Web::CompositorContextId context_id, NonnullRefPtr<Gfx::Bitmap> target_bitmap, Function<void(ScreenshotResult)>&& callback)
+{
+    if (auto* connection = compositor_connection()) {
+        connection->request_screenshot(context_id, move(target_bitmap), move(callback));
+        return;
+    }
+    if (callback)
+        callback(ScreenshotResult::Failed);
+}
+
+}
