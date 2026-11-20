@@ -1,9 +1,12 @@
 name: Build Ladybird Android (arm64 + armv7)
 
+# Based on Ladybird's own Nightly Android job (macOS runner), with our custom
+# Compose UI and dual-ABI release packaging.
+
 on:
   push:
   schedule:
-    - cron: '0 0 * * 1'   # every 7 days
+    - cron: '0 0 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -14,13 +17,14 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  LADYBIRD_SOURCE_DIR: ${{ github.workspace }}
   LADYBIRD_CACHE_DIR: ${{ github.workspace }}/Build/caches
   VCPKG_ROOT: ${{ github.workspace }}/Build/vcpkg
   VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-binary-cache
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: macos-14
     timeout-minutes: 355
     steps:
       - uses: actions/checkout@v7.0.1
@@ -35,10 +39,10 @@ jobs:
           echo "version=1.0-expressive-$DATE-$SHA" >> "$GITHUB_OUTPUT"
           echo "tag=nightly-$DATE-$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Install system build tools (vcpkg ports)
+      - name: Install host build tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y autoconf automake autoconf-archive libtool pkg-config nasm ninja-build
+          brew update
+          brew install autoconf autoconf-archive automake ccache coreutils libtool llvm nasm ninja pkg-config sccache unzip || true
 
       - name: Set up JDK 17
         uses: actions/setup-java@v6
@@ -48,15 +52,6 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
-
-      - name: Install wasm-tools
-        run: |
-          VERSION=1.243.0
-          FILE="wasm-tools-${VERSION}-x86_64-linux.tar.gz"
-          curl -fsSL -o "$FILE" "https://github.com/bytecodealliance/wasm-tools/releases/download/v${VERSION}/${FILE}"
-          tar -xzf "$FILE"
-          mv "wasm-tools-${VERSION}-x86_64-linux/wasm-tools" /usr/local/bin/
-          rm -rf "$FILE" "wasm-tools-${VERSION}-x86_64-linux"
 
       - name: Install Android SDK components
         run: |
@@ -69,42 +64,61 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vcpkg-binary-cache
-          key: vcpkg-android-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-macos-android-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
           restore-keys: |
-            vcpkg-android-
+            vcpkg-macos-android-
 
       - name: Set up vcpkg (Ladybird bootstrap)
         run: python3 Meta/ladybird.py vcpkg --preset Release
 
-      - name: Fix meson native compiler for Ladybird's libpsl port
+      - name: Give meson cross-ports a real native compiler
         run: |
-          cat > $VCPKG_ROOT/scripts/buildsystems/meson/none.txt <<'NATIVEFILE'
-          [host_machine]
-          system = 'linux'
-          cpu_family = 'x86_64'
-          cpu = 'x86_64'
+          python3 - <<'PY'
+          import os, pathlib
+          p = pathlib.Path(os.environ['VCPKG_ROOT']) / 'scripts/buildsystems/meson/none.txt'
+          p.write_text('''[host_machine]
+          system = 'darwin'
+          cpu_family = 'aarch64'
+          cpu = 'arm64'
           endian = 'little'
 
           [properties]
 
           [binaries]
-          c = '/usr/bin/gcc'
-          cpp = '/usr/bin/g++'
-          ar = '/usr/bin/gcc-ar'
+          c = '/usr/bin/clang'
+          cpp = '/usr/bin/clang++'
+          ar = '/usr/bin/ar'
           strip = '/usr/bin/strip'
           pkgconfig = '/usr/bin/pkg-config'
-          NATIVEFILE
+          '''.replace('\n          ', '\n'))
+          print(p.read_text())
+          PY
 
       - name: Stamp version and build both ABIs
         run: |
           set -euo pipefail
-          sed -i "s/versionCode = 1$/versionCode = ${{ steps.ver.outputs.date }}/" UI/Android/build.gradle.kts
-          sed -i "s/versionName = \"1.0\"/versionName = \"${{ steps.ver.outputs.version }}\"/" UI/Android/build.gradle.kts
+          python3 - <<'PY'
+          import os, pathlib
+          p = pathlib.Path('UI/Android/build.gradle.kts')
+          s = p.read_text()
+          date = os.environ['BUILD_DATE']
+          version = os.environ['VERSION_NAME']
+          s = s.replace('versionCode = 1', f'versionCode = {date}')
+          s = s.replace('versionName = "1.0"', f'versionName = "{version}"')
+          p.write_text(s)
+          PY
           build_abi() {
             ABI="$1"; LABEL="$2"
             echo "===== Building Ladybird engine for $ABI ====="
-            sed -i "s/abiFilters += listOf(.*)/abiFilters += listOf(\"$ABI\")/" UI/Android/build.gradle.kts
-            grep -nE "abiFilters|RUST_TARGET_TRIPLE" UI/Android/build.gradle.kts
+            python3 - "$ABI" <<'PY'
+          import sys, pathlib
+          abi = sys.argv[1]
+          p = pathlib.Path('UI/Android/build.gradle.kts')
+          lines = p.read_text().splitlines()
+          lines = [('            abiFilters += listOf("' + abi + '")') if 'abiFilters += listOf' in l else l for l in lines]
+          p.write_text('\n'.join(lines) + '\n')
+          PY
+            grep -n abiFilters UI/Android/build.gradle.kts
             rm -rf UI/Android/.cxx UI/Android/build
             ( cd UI/Android && ./gradlew --no-daemon assembleRelease )
             UNSIGNED=$(find UI/Android/build/outputs/apk/release -name '*.apk' | head -n 1)
@@ -114,6 +128,8 @@ jobs:
           build_abi armeabi-v7a armv7
         env:
           GRADLE_OPTS: '-Xmx3072m'
+          BUILD_DATE: ${{ steps.ver.outputs.date }}
+          VERSION_NAME: ${{ steps.ver.outputs.version }}
 
       - name: Sign APKs
         run: |
