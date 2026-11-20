@@ -110,6 +110,18 @@ jobs:
           curl --retry 6 --retry-all-errors -fsSL "https://github.com/t43rr7/libcgroup/commit/592dcdcf243576bd2517d3da9bc18990de08e37e.patch?full_index=1" -o "Build/vcpkg/downloads/0000-fix-systemd-header-installation.patch" || echo "failed: 0000-fix-systemd-header-installation.patch"
           ls Build/vcpkg/downloads/*.patch | wc -l
 
+      - name: Patch libproxy port for Android (no -lpthread)
+        run: |
+          python3 - <<'PY'
+          import os, pathlib
+          p = pathlib.Path(os.environ['VCPKG_ROOT']) / 'ports/libproxy/portfile.cmake'
+          s = p.read_text()
+          assert '-DWITH_WEBKIT3=OFF' in s
+          s = s.replace('-DWITH_WEBKIT3=OFF', '-DCMAKE_THREAD_LIBS_INIT= -DWITH_WEBKIT3=OFF', 1)
+          p.write_text(s)
+          print('patched libproxy portfile')
+          PY
+
       - name: Give meson cross-ports a real native compiler
         run: |
           python3 - <<'PY'
