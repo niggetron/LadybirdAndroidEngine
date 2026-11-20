@@ -30,7 +30,6 @@ members = [
     "Libraries/RustAllocator",
     "Services/Compositor/Rust",
     "Services/WebRTCClient",
-    "Tests/LibIPC/RustEchoServer",
 ]
 exclude = [
     "Libraries/LibJS/Flap",
