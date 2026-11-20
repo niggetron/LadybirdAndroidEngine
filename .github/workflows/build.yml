@@ -15,7 +15,7 @@ concurrency:
 
 env:
   LADYBIRD_CACHE_DIR: ${{ github.workspace }}/Build/caches
-  VCPKG_ROOT: /opt/vcpkg
+  VCPKG_ROOT: ${{ github.workspace }}/Build/vcpkg
   VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-binary-cache
 
 jobs:
@@ -73,17 +73,12 @@ jobs:
           restore-keys: |
             vcpkg-android-
 
-      - name: Set up vcpkg
-        run: |
-          REV=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
-          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git /opt/vcpkg
-          git -C /opt/vcpkg checkout "$REV"
-          /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
-          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+      - name: Set up vcpkg (Ladybird bootstrap)
+        run: python3 Meta/ladybird.py vcpkg --preset Release
 
       - name: Fix meson native compiler for Ladybird's libpsl port
         run: |
-          cat > /opt/vcpkg/scripts/buildsystems/meson/none.txt <<'NATIVEFILE'
+          cat > $VCPKG_ROOT/scripts/buildsystems/meson/none.txt <<'NATIVEFILE'
           [host_machine]
           system = 'linux'
           cpu_family = 'x86_64'
