@@ -71,7 +71,7 @@ jobs:
             "cmake;3.31.6" "ndk;29.0.13599879" > /dev/null
 
       - name: Restore vcpkg binary cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: vcpkg-binary-cache
           key: vcpkg-android-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
