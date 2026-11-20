@@ -302,3 +302,13 @@ Optional<SkFont> skia_font(Gfx::Font const& font, float scale, [[maybe_unused]] 
 }
 
 }
+
+
+#ifdef AK_OS_ANDROID
+// Android Skia builds in vcpkg do not export SkFontMgr_empty.cpp; platform
+// typefaces are used directly, so the fallback manager is not needed.
+sk_sp<SkFontMgr> SkFontMgr_New_Custom_Empty()
+{
+    return nullptr;
+}
+#endif

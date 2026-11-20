@@ -18,6 +18,7 @@
 #include <LibWebCommon/Page/PageId.h>
 #include <LibWebView/BrowsingSession.h>
 #include <LibWebView/Forward.h>
+#include <LibWebView/Options.h>
 #include <LibWebView/WebContentClient.h>
 #include <RequestServer/SiteBinding.h>
 
