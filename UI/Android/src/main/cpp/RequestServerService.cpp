@@ -16,6 +16,7 @@
 #include <LibIPC/SingleServer.h>
 #include <LibTLS/TLSv12.h>
 #include <LibWebView/Utilities.h>
+#include <curl/curl.h>
 #include <RequestServer/ConnectionFromClient.h>
 #include <RequestServer/IsPrivate.h>
 #include <RequestServer/SiteBinding.h>
@@ -36,13 +37,13 @@ ErrorOr<int> service_main(int ipc_socket)
     auto socket = TRY(Core::LocalSocket::adopt_fd(ipc_socket));
     RequestServer::ConnectionFromClient::ConnectionMap connections;
     RequestServer::ConnectionFromClient::RequestTransferLeaseMap request_transfer_leases;
-    auto client = adopt_ref(*new RequestServer::ConnectionFromClient(
+    auto client = RequestServer::ConnectionFromClient::construct(
         make<IPC::Transport>(move(socket)),
         RequestServer::IsPrivate::No,
         RequestServer::SiteBinding::Unrestricted,
         connections,
         request_transfer_leases,
-        {}));
+        {});
 
     return event_loop.exec();
 }
