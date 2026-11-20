@@ -37,8 +37,8 @@ jobs:
 
       - name: Install host build tools
         run: |
-          brew update
-          brew install autoconf autoconf-archive automake ccache coreutils libtool llvm nasm ninja pkg-config sccache unzip || true
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake autoconf-archive libtool pkg-config nasm ninja-build
 
       - name: Set up JDK 17
         uses: actions/setup-java@v6
@@ -73,16 +73,16 @@ jobs:
           import os, pathlib
           p = pathlib.Path(os.environ['VCPKG_ROOT']) / 'scripts/buildsystems/meson/none.txt'
           p.write_text('''[host_machine]
-          system = 'darwin'
-          cpu_family = 'aarch64'
-          cpu = 'arm64'
+          system = 'linux'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
           endian = 'little'
 
           [properties]
 
           [binaries]
-          c = '/usr/bin/clang'
-          cpp = '/usr/bin/clang++'
+          c = '/usr/bin/gcc'
+          cpp = '/usr/bin/g++'
           ar = '/usr/bin/ar'
           strip = '/usr/bin/strip'
           pkgconfig = '/usr/bin/pkg-config'
