@@ -43,7 +43,7 @@ ErrorOr<int> service_main(int ipc_socket)
         RequestServer::SiteBinding::Unrestricted,
         connections,
         request_transfer_leases,
-        {});
+        Optional<HTTP::DiskCache&> {});
 
     return event_loop.exec();
 }
