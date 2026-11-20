@@ -1,0 +1,148 @@
+name: Build Ladybird Android (arm64 + armv7)
+
+on:
+  push:
+  schedule:
+    - cron: '0 0 * * 1'   # every 7 days
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ladybird-android-build
+  cancel-in-progress: true
+
+env:
+  LADYBIRD_CACHE_DIR: ${{ github.workspace }}/Build/caches
+  VCPKG_ROOT: /opt/vcpkg
+  VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-binary-cache
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Compute version
+        id: ver
+        run: |
+          DATE=$(date -u +%Y%m%d)
+          SHA=$(git rev-parse --short=7 HEAD)
+          echo "date=$DATE" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "version=1.0-expressive-$DATE-$SHA" >> "$GITHUB_OUTPUT"
+          echo "tag=nightly-$DATE-$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Install system build tools (vcpkg ports)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake autoconf-archive libtool pkg-config nasm
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Install wasm-tools
+        run: |
+          VERSION=1.243.0
+          FILE="wasm-tools-${VERSION}-x86_64-linux.tar.gz"
+          curl -fsSL -o "$FILE" "https://github.com/bytecodealliance/wasm-tools/releases/download/v${VERSION}/${FILE}"
+          tar -xzf "$FILE"
+          mv "wasm-tools-${VERSION}-x86_64-linux/wasm-tools" /usr/local/bin/
+          rm -rf "$FILE" "wasm-tools-${VERSION}-x86_64-linux"
+
+      - name: Install Android SDK components
+        run: |
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" "build-tools;35.0.0" "platforms;android-35" \
+            "cmake;3.31.6" "ndk;29.0.13599879" > /dev/null
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-binary-cache
+          key: vcpkg-android-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-android-
+
+      - name: Set up vcpkg
+        run: |
+          REV=$(python3 -c "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
+          git clone --filter=blob:none https://github.com/microsoft/vcpkg.git /opt/vcpkg
+          git -C /opt/vcpkg checkout "$REV"
+          /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
+
+      - name: Fix meson native compiler for Ladybird's libpsl port
+        run: |
+          cat > /opt/vcpkg/scripts/buildsystems/meson/none.txt <<'NATIVEFILE'
+          [host_machine]
+          system = 'linux'
+          cpu_family = 'x86_64'
+          cpu = 'x86_64'
+          endian = 'little'
+
+          [properties]
+
+          [binaries]
+          c = '/usr/bin/gcc'
+          cpp = '/usr/bin/g++'
+          ar = '/usr/bin/gcc-ar'
+          strip = '/usr/bin/strip'
+          pkgconfig = '/usr/bin/pkg-config'
+          NATIVEFILE
+
+      - name: Stamp version and build both ABIs
+        run: |
+          set -euo pipefail
+          sed -i "s/versionCode = 1$/versionCode = ${{ steps.ver.outputs.date }}/" UI/Android/build.gradle.kts
+          sed -i "s/versionName = \"1.0\"/versionName = \"${{ steps.ver.outputs.version }}\"/" UI/Android/build.gradle.kts
+          build_abi() {
+            ABI="$1"; LABEL="$2"
+            echo "===== Building Ladybird engine for $ABI ====="
+            sed -i "s/abiFilters += listOf(.*)/abiFilters += listOf(\"$ABI\")/" UI/Android/build.gradle.kts
+            grep -nE "abiFilters|RUST_TARGET_TRIPLE" UI/Android/build.gradle.kts
+            rm -rf UI/Android/.cxx UI/Android/build
+            ( cd UI/Android && ./gradlew --no-daemon assembleRelease )
+            UNSIGNED=$(find UI/Android/build/outputs/apk/release -name '*.apk' | head -n 1)
+            cp "$UNSIGNED" "${LABEL}-unsigned.apk"
+          }
+          build_abi arm64-v8a arm64
+          build_abi armeabi-v7a armv7
+        env:
+          GRADLE_OPTS: '-Xmx3072m'
+
+      - name: Sign APKs
+        run: |
+          set -euo pipefail
+          keytool -genkeypair -v -keystore release.keystore -alias ladybird \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass ladybird-sign-2026 -keypass ladybird-sign-2026 \
+            -dname "CN=Ladybird Engine, OU=CI, O=niggetron, L=Internet, S=Internet, C=US"
+          BT="${ANDROID_SDK_ROOT}/build-tools/35.0.0"
+          for LABEL in arm64 armv7; do
+            "$BT/zipalign" -f 4 "${LABEL}-unsigned.apk" "${LABEL}-aligned.apk"
+            "$BT/apksigner" sign --ks release.keystore \
+              --ks-pass pass:ladybird-sign-2026 --key-pass pass:ladybird-sign-2026 \
+              --out "LadybirdEngine-${{ steps.ver.outputs.version }}-${LABEL}.apk" "${LABEL}-aligned.apk"
+            "$BT/apksigner" verify "LadybirdEngine-${{ steps.ver.outputs.version }}-${LABEL}.apk"
+          done
+
+      - name: Publish release
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" \
+            "LadybirdEngine-${{ steps.ver.outputs.version }}-arm64.apk" \
+            "LadybirdEngine-${{ steps.ver.outputs.version }}-armv7.apk" \
+            --title "Ladybird Engine ${{ steps.ver.outputs.version }}" \
+            --notes "Ladybird engine for Android with our own Material 3 expressive Compose UI (vertical tabs, arc bar). Both arm64-v8a and armeabi-v7a APKs included." \
+            --latest
+        env:
+          GH_TOKEN: ${{ github.token }}
