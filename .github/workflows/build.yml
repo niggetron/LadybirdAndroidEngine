@@ -117,9 +117,10 @@ jobs:
           p = pathlib.Path(os.environ['VCPKG_ROOT']) / 'ports/libproxy/portfile.cmake'
           s = p.read_text()
           assert '-DWITH_WEBKIT3=OFF' in s
-          s = s.replace('-DWITH_WEBKIT3=OFF', '-DCMAKE_THREAD_LIBS_INIT= -DWITH_WEBKIT3=OFF', 1)
+          s = s.replace('-DWITH_WEBKIT3=OFF', '-DCMAKE_HAVE_LIBC_PTHREAD=1\n        -DCMAKE_THREAD_LIBS_INIT=""\n        -DWITH_WEBKIT3=OFF', 1)
           p.write_text(s)
-          print('patched libproxy portfile')
+          print('patched libproxy portfile:')
+          print('\n'.join(l for l in s.splitlines() if 'THREAD' in l or 'WEBKIT3' in l))
           PY
 
       - name: Give meson cross-ports a real native compiler
