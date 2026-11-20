@@ -9,7 +9,7 @@
 #include <AK/Random.h>
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/DecodedImageFrame.h>
-#include <LibGfx/Painter.h>
+#include <string.h>
 #include <LibWebView/ViewImplementation.h>
 #include <LibWebView/WebContentClient.h>
 #include <android/bitmap.h>
@@ -73,13 +73,35 @@ void WebViewImplementationNative::paint_into_bitmap(void* android_bitmap_raw, An
 {
     // Software bitmaps only for now!
     VERIFY((info.flags & ANDROID_BITMAP_FLAGS_IS_HARDWARE) == 0);
+    if (!android_bitmap_raw)
+        return;
 
-    auto android_bitmap = MUST(Gfx::Bitmap::create_wrapper(to_gfx_bitmap_format(info.format), Gfx::AlphaType::Premultiplied, { info.width, info.height }, info.stride, android_bitmap_raw));
-    auto painter = Gfx::Painter::create(android_bitmap);
-    if (auto* bitmap = m_client_state.has_usable_bitmap ? m_client_state.front_bitmap.bitmap.ptr() : m_backup_bitmap.ptr())
-        painter->draw_bitmap(android_bitmap->rect().to_type<float>(), MUST(Gfx::DecodedImageFrame::create(*MUST(bitmap->clone()))), bitmap->rect(), Gfx::ScalingMode::NearestNeighbor, {}, 1.0f, Gfx::CompositingAndBlendingOperator::Copy);
-    else
-        painter->fill_rect(android_bitmap->rect().to_type<float>(), Gfx::Color::Magenta);
+    auto* destination = static_cast<u8*>(android_bitmap_raw);
+    auto const width = static_cast<size_t>(info.width);
+    auto const height = static_cast<size_t>(info.height);
+    auto const stride = static_cast<size_t>(info.stride);
+
+    Gfx::Bitmap const* source = m_client_state.has_usable_bitmap
+        ? m_client_state.front_bitmap.bitmap.ptr()
+        : m_backup_bitmap.ptr();
+
+    if (!source) {
+        for (size_t y = 0; y < height; ++y) {
+            auto* row = destination + y * stride;
+            for (size_t x = 0; x < min(width, stride / 4); ++x) {
+                row[x * 4 + 0] = 0xFF;
+                row[x * 4 + 1] = 0x00;
+                row[x * 4 + 2] = 0xFF;
+                row[x * 4 + 3] = 0xFF;
+            }
+        }
+        return;
+    }
+
+    auto const columns = min(width, static_cast<size_t>(source->width()));
+    auto const rows = min(height, static_cast<size_t>(source->height()));
+    for (size_t y = 0; y < rows; ++y)
+        memcpy(destination + y * stride, source->scanline_u8(static_cast<int>(y)), columns * 4);
 }
 
 void WebViewImplementationNative::set_viewport_geometry(int w, int h)
