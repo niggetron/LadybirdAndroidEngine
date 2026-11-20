@@ -1,0 +1,11 @@
+// https://html.spec.whatwg.org/multipage/dnd.html#the-dragevent-interface
+[Exposed=Window]
+interface DragEvent : MouseEvent {
+    constructor(DOMString type, optional DragEventInit eventInitDict = {});
+
+    [DirectGetter] readonly attribute DataTransfer? dataTransfer;
+};
+
+dictionary DragEventInit : MouseEventInit {
+    DataTransfer? dataTransfer = null;
+};
