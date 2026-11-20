@@ -220,7 +220,7 @@ mod fault {
     static mut PREVIOUS_SIGSEGV: libc::sigaction = unsafe { std::mem::zeroed() };
     static mut PREVIOUS_SIGBUS: libc::sigaction = unsafe { std::mem::zeroed() };
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "x86_64"))]
     unsafe fn instruction_pointer(context: *mut libc::c_void) -> *mut usize {
         unsafe {
             let context = context.cast::<libc::ucontext_t>();
@@ -228,11 +228,19 @@ mod fault {
         }
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
     unsafe fn instruction_pointer(context: *mut libc::c_void) -> *mut usize {
         unsafe {
             let context = context.cast::<libc::ucontext_t>();
             (&raw mut (*context).uc_mcontext.pc).cast()
+        }
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "x86"))]
+    unsafe fn instruction_pointer(context: *mut libc::c_void) -> *mut usize {
+        unsafe {
+            let context = context.cast::<libc::ucontext_t>();
+            (&raw mut (*context).uc_mcontext.gregs[libc::REG_EIP as usize]).cast()
         }
     }
 
@@ -241,6 +249,14 @@ mod fault {
         unsafe {
             let context = context.cast::<libc::ucontext_t>();
             (&raw mut (*(*context).uc_mcontext).__ss.__rip).cast()
+        }
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "arm"))]
+    unsafe fn instruction_pointer(context: *mut libc::c_void) -> *mut usize {
+        unsafe {
+            let context = context.cast::<libc::ucontext_t>();
+            (&raw mut (*context).uc_mcontext.arm_pc).cast()
         }
     }
 

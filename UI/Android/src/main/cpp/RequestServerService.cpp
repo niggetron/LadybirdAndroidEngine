@@ -17,6 +17,8 @@
 #include <LibTLS/TLSv12.h>
 #include <LibWebView/Utilities.h>
 #include <RequestServer/ConnectionFromClient.h>
+#include <RequestServer/IsPrivate.h>
+#include <RequestServer/SiteBinding.h>
 
 namespace RequestServer {
 
@@ -32,7 +34,15 @@ ErrorOr<int> service_main(int ipc_socket)
     auto& event_loop = Core::EventLoop::initialize_for_current_thread();
 
     auto socket = TRY(Core::LocalSocket::adopt_fd(ipc_socket));
-    auto client = TRY(RequestServer::ConnectionFromClient::try_create(make<IPC::Transport>(move(socket))));
+    RequestServer::ConnectionFromClient::ConnectionMap connections;
+    RequestServer::ConnectionFromClient::RequestTransferLeaseMap request_transfer_leases;
+    auto client = adopt_ref(*new RequestServer::ConnectionFromClient(
+        make<IPC::Transport>(move(socket)),
+        RequestServer::IsPrivate::No,
+        RequestServer::SiteBinding::Unrestricted,
+        connections,
+        request_transfer_leases,
+        {}));
 
     return event_loop.exec();
 }
