@@ -17,6 +17,7 @@ env:
   LADYBIRD_CACHE_DIR: ${{ github.workspace }}/Build/caches
   VCPKG_ROOT: ${{ github.workspace }}/Build/vcpkg
   VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}/vcpkg-binary-cache
+  VCPKG_INSTALL_OPTIONS: --allow-unsupported
 
 jobs:
   build:
@@ -101,6 +102,7 @@ jobs:
           version = os.environ['VERSION_NAME']
           s = s.replace('versionCode = 1', f'versionCode = {date}')
           s = s.replace('versionName = "1.0"', f'versionName = "{version}"')
+          s = s.replace('"-DVCPKG_TARGET_ANDROID=ON"', '"-DVCPKG_TARGET_ANDROID=ON", "-DVCPKG_INSTALL_OPTIONS=--allow-unsupported"')
           p.write_text(s)
           PY
           build_abi() {
