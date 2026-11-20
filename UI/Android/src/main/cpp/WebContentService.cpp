@@ -25,6 +25,7 @@
 #include <LibWeb/Platform/RemoteImageCodecPlugin.h>
 #include <LibWebCommon/WebView/SiteIsolation.h>
 #include <LibWebView/HelperProcess.h>
+#include <LibWebView/Options.h>
 #include <LibWebView/Utilities.h>
 #include <WebContent/ConnectionFromClient.h>
 #include <WebContent/PageHost.h>

@@ -76,7 +76,7 @@ foreach(angle_target IN LISTS ANGLE_TARGETS)
 endforeach()
 
 get_target_property(_libcompositing_rust_lib libcompositing_rust IMPORTED_LOCATION)
-if ((LINUX OR BSD) AND NOT BUILD_SHARED_LIBS)
+if ((LINUX OR BSD OR ANDROID) AND NOT BUILD_SHARED_LIBS)
     target_link_options(LibCompositing INTERFACE LINKER:--allow-multiple-definition)
 endif()
 if ((LINUX OR BSD) AND BUILD_SHARED_LIBS)
