@@ -6,7 +6,9 @@
  */
 
 #include "Loader.h"
+#ifndef AK_OS_ANDROID
 #include "FFmpegLoader.h"
+#endif
 #include <AK/TypedTransfer.h>
 #include <LibCore/MappedFile.h>
 
@@ -27,9 +29,14 @@ struct LoaderPluginInitializer {
     ErrorOr<NonnullOwnPtr<LoaderPlugin>> (*create)(NonnullOwnPtr<SeekableStream>);
 };
 
+#ifdef AK_OS_ANDROID
+// No FFmpeg audio loader on Android (FFmpeg is not built for the target).
+static constexpr LoaderPluginInitializer s_initializers[] = {};
+#else
 static constexpr LoaderPluginInitializer s_initializers[] = {
     { FFmpegLoaderPlugin::sniff, FFmpegLoaderPlugin::create },
 };
+#endif
 
 ErrorOr<NonnullRefPtr<Loader>> Loader::create(StringView path)
 {
