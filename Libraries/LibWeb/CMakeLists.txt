@@ -2,13 +2,19 @@ include(libweb_generators)
 include(vulkan)
 include(skia)
 
-find_package(unofficial-angle CONFIG)
-if(unofficial-angle_FOUND)
-    set(ANGLE_TARGETS unofficial::angle::libEGL unofficial::angle::libGLESv2)
+if (ANDROID)
+    # Android uses the NDK's system EGL/GLES libraries; vcpkg's ANGLE port
+    # does not provide an unofficial-angle CMake package or angle.pc there.
+    set(ANGLE_TARGETS "")
 else()
-    find_package(PkgConfig)
-    pkg_check_modules(angle REQUIRED IMPORTED_TARGET angle)
-    set(ANGLE_TARGETS PkgConfig::angle)
+    find_package(unofficial-angle CONFIG)
+    if(unofficial-angle_FOUND)
+        set(ANGLE_TARGETS unofficial::angle::libEGL unofficial::angle::libGLESv2)
+    else()
+        find_package(PkgConfig)
+        pkg_check_modules(angle REQUIRED IMPORTED_TARGET angle)
+        set(ANGLE_TARGETS PkgConfig::angle)
+    endif()
 endif()
 
 set(SOURCES
