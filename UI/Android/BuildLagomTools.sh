@@ -31,6 +31,7 @@ export XDG_CACHE_HOME="$CACHE_DIR"
 
 cmake -S "${LADYBIRD_SOURCE_DIR}/Meta/Lagom" -B "$BUILD_DIR/lagom-tools" \
     -GNinja -DCMAKE_MAKE_PROGRAM="$(command -v ninja)" -Dpackage=LagomTools \
+    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
     -DCMAKE_INSTALL_PREFIX="$BUILD_DIR/lagom-tools-install"  \
     -DCMAKE_C_COMPILER="$CC" \
     -DCMAKE_CXX_COMPILER="$CXX" \
